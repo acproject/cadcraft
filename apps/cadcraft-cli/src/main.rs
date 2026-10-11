@@ -5,7 +5,10 @@
 //! cadcraft-cli convert IN.dxf OUT.(dxf|svg|png)    convert / export
 //! cadcraft-cli run [FILE|--sample|--metric] [--script TEXT|--script-file F.scr] [--cmd 'id {json}']... [--save OUT] [--export OUT.png]
 //! cadcraft-cli commands [FILTER]                   command catalog (JSON)
-//! cadcraft-cli mcp [--connect HOST:PORT]           MCP server on stdio (headless or bridged to the app)
+//! cadcraft-cli mcp [--connect HOST:PORT] [--open FILE]
+//!                                                  MCP server on stdio (headless or bridged)
+//! cadcraft-cli mcp-config [--ide ID] [--connect HOST:PORT] [--open FILE] [--write]
+//!                                                  print/merge the stdio config for an AI IDE
 //! cadcraft-cli perf [N]                            timing table on a synthetic N-entity drawing
 //! cadcraft-cli sample (bracket|floorplan) OUT       write a built-in sample drawing
 //! ```
@@ -21,7 +24,9 @@ const USAGE: &str = "usage:
   cadcraft-cli convert IN.dxf OUT.(dxf|svg|png)
   cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg)]
   cadcraft-cli commands [FILTER]
-  cadcraft-cli mcp [--connect HOST:PORT]
+  cadcraft-cli mcp [--connect HOST:PORT] [--open FILE]
+  cadcraft-cli mcp-config [--ide generic|claude-desktop|cursor|trae|windsurf|cline|vscode]
+                 [--connect HOST:PORT] [--open FILE] [--write]
   cadcraft-cli perf [N]
   cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version";
@@ -264,6 +269,96 @@ fn perf(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Pull `--flag VALUE` pairs out of an argument list. Unknown flags / missing values error out.
+fn parse_kv_options(args: &[String], allowed: &[&str]) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let key = a.strip_prefix("--").ok_or_else(|| format!("unexpected argument `{a}`"))?;
+        if !allowed.contains(&key) {
+            return Err(format!("unknown option --{key}"));
+        }
+        let value = it.next().ok_or_else(|| format!("--{key} needs a value"))?;
+        out.insert(key.to_string(), value.clone());
+    }
+    Ok(out)
+}
+
+/// `mcp`: serve MCP over stdio, headless or bridged to a running app.
+fn mcp_serve(args: &[String]) -> Result<(), String> {
+    let opts = parse_kv_options(args, &["connect", "open"])?;
+    // --connect wins; otherwise an env var lets an IDE config launch a bridged server without
+    // extra args (CADCRAFT_MCP_CONNECT=127.0.0.1:7979).
+    let connect = opts.get("connect").cloned().or_else(|| std::env::var("CADCRAFT_MCP_CONNECT").ok().filter(|a| !a.trim().is_empty()));
+    if connect.is_some() && opts.contains_key("open") {
+        return Err("--open only applies to the headless backend (without --connect)".into());
+    }
+    let backend: Box<dyn cadcraft_mcp::Backend> = match connect {
+        Some(addr) => Box::new(cadcraft_mcp::Remote::connect(&addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?),
+        None => {
+            let mut headless = cadcraft_mcp::Headless::default();
+            if let Some(path) = opts.get("open") {
+                headless.session.execute("open", &json!({ "path": path })).map_err(|e| e.to_string())?;
+            }
+            Box::new(headless)
+        }
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    cadcraft_mcp::Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+}
+
+/// `mcp-config`: emit (and optionally merge) the stdio config an AI IDE needs to launch us.
+fn mcp_config(args: &[String]) -> Result<(), String> {
+    use cadcraft_mcp::{Ide, Launch};
+    let write = args.iter().any(|a| a == "--write");
+    let valued: Vec<String> = args.iter().filter(|a| **a != "--write").cloned().collect();
+    let opts = parse_kv_options(&valued, &["ide", "connect", "open"])?;
+    let ide = match opts.get("ide") {
+        Some(id) => Ide::parse(id)
+            .ok_or_else(|| format!("unknown --ide `{id}` (one of: {})", Ide::all().iter().map(|i| i.id()).collect::<Vec<_>>().join(", ")))?,
+        None => Ide::Generic,
+    };
+    let command = std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)).unwrap_or_else(|| "cadcraft-cli".to_string());
+    let mut launch = Launch::new(command);
+    if let Some(addr) = opts.get("connect") {
+        launch = launch.connect(addr);
+    }
+    if let Some(path) = opts.get("open") {
+        launch = launch.open(path);
+    }
+
+    let json = cadcraft_mcp::config_snippet(ide, &launch);
+    let pretty = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+
+    if write {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).map_err(|_| "cannot find the home directory (set HOME)")?;
+        let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+        let path = ide
+            .config_path(std::path::Path::new(&home), &cwd)
+            .ok_or_else(|| format!("{} has no conventional config file; rerun without --write and paste the JSON", ide.label()))?;
+        let existing = if path.is_file() { std::fs::read_to_string(&path).ok() } else { None };
+        let merged = cadcraft_mcp::merge_config(existing.as_deref(), ide, &launch)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::write(&path, merged).map_err(|e| format!("{}: {e}", path.display()))?;
+        eprintln!("merged cadcraft into {} (other servers preserved)", path.display());
+    } else {
+        eprintln!("{} — paste this into the IDE's MCP settings:", ide.label());
+        if let Some(path) = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .and_then(|h| std::env::current_dir().ok().map(|c| (h, c)))
+            .and_then(|(h, c)| ide.config_path(std::path::Path::new(&h), &c))
+        {
+            eprintln!("(config file: {})", path.display());
+        }
+    }
+    println!("{pretty}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     install_io();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -291,21 +386,8 @@ fn main() -> ExitCode {
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             Ok(())
         }
-        Some("mcp") => {
-            let backend: Box<dyn cadcraft_mcp::Backend> = match rest.iter().position(|a| a == "--connect").and_then(|i| rest.get(i + 1)) {
-                Some(addr) => match cadcraft_mcp::Remote::connect(addr) {
-                    Ok(r) => Box::new(r),
-                    Err(e) => {
-                        eprintln!("cadcraft-cli: cannot connect to {addr}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                },
-                None => Box::new(cadcraft_mcp::Headless::default()),
-            };
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            cadcraft_mcp::Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
-        }
+        Some("mcp") => mcp_serve(&rest),
+        Some("mcp-config") => mcp_config(&rest),
         Some("--version" | "-V") => {
             println!("cadcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())

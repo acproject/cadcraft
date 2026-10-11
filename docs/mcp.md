@@ -19,6 +19,44 @@ Example client configuration (Claude Code / Claude Desktop):
 { "mcpServers": { "cadcraft": { "command": "cadcraft-cli", "args": ["mcp"] } } }
 ```
 
+## Connect an AI IDE
+
+Any MCP host that can spawn a stdio command works (Cursor, VS Code + GitHub Copilot/Cline,
+Trae, Windsurf, Claude Desktop, Claude Code…). Generate a ready-to-paste config with the CLI —
+it fills in the absolute path of the `cadcraft-cli` binary itself:
+
+```sh
+cadcraft-cli mcp-config --ide cursor        # print Cursor's ~/.cursor/mcp.json entry
+cadcraft-cli mcp-config --ide vscode        # .vscode/mcp.json (servers / stdio)
+cadcraft-cli mcp-config --ide trae          # Trae / Trae CN global mcp.json
+cadcraft-cli mcp-config --ide windsurf
+cadcraft-cli mcp-config --ide claude-desktop
+cadcraft-cli mcp-config --ide cline
+cadcraft-cli mcp-config                     # generic {"mcpServers": {...}} shape
+```
+
+Add `--write` to merge the entry straight into that IDE's config file (existing servers and
+settings are preserved; rerunning is safe and idempotent):
+
+```sh
+cadcraft-cli mcp-config --ide cursor --write
+```
+
+Variants:
+
+```sh
+# Headless server that opens a drawing on startup:
+cadcraft-cli mcp-config --open "$HOME/drawings/house.dxf"
+
+# Bridge to the running app instead (watch the agent draw in the window):
+cadcraft --control 7979 &
+cadcraft-cli mcp-config --ide cursor --connect 127.0.0.1:7979
+```
+
+If the IDE only lets you edit env vars, the same bridge is picked up from
+`CADCRAFT_MCP_CONNECT=127.0.0.1:7979`. The server writes nothing to stdout except protocol
+messages, so it is safe to spawn from any host.
+
 ## Tools
 
 | Tool | What it does |

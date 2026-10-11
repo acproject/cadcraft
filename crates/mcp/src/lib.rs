@@ -9,10 +9,12 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod ide;
 mod server;
 mod tools;
 
 pub use backend::{Backend, Headless, Remote};
+pub use ide::{Ide, Launch, merge as merge_config, server_entry, snippet as config_snippet};
 pub use server::{PROTOCOL_VERSION, Server};
 
 #[cfg(test)]
