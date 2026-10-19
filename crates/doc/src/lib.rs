@@ -6,24 +6,38 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod array;
 mod constraint;
 mod entity;
 mod extents;
+mod gdt;
 mod header;
 pub mod library;
+mod plotstyle;
+mod plotter;
+mod refedit;
 mod store;
 mod tables;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+pub use array::*;
 pub use cadcraft_color as color;
 pub use cadcraft_geom as geom;
 pub use constraint::*;
 pub use entity::*;
 pub use extents::{MAX_BLOCK_DEPTH, entity_bounds};
+pub use gdt::*;
 pub use header::{HVal, Header};
+pub use plotstyle::*;
+pub use plotter::*;
+pub use refedit::{RefEdit, WorkItem};
 pub use store::EntityStore;
 pub use tables::*;
+
+/// File data CADCraft doesn't model, kept for saving (#528).
+pub mod dynblock;
+pub mod foreign;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -48,28 +62,71 @@ pub enum Space {
     Paper(String),
 }
 
+impl Space {
+    /// Whether this is a layout's paper space.
+    pub fn is_paper(&self) -> bool {
+        matches!(self, Space::Paper(_))
+    }
+
+    /// The layout whose paper space this is; `None` for model space.
+    pub fn layout(&self) -> Option<&str> {
+        match self {
+            Space::Paper(n) => Some(n),
+            Space::Model => None,
+        }
+    }
+
+    /// The tab name (CTAB): `Model`, or the layout's name.
+    pub fn tab_name(&self) -> &str {
+        self.layout().unwrap_or("Model")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drawing {
     pub header: Header,
+    /// File data CADCraft does not model, written back on save.
+    pub foreign: std::sync::Arc<foreign::Foreign>,
     pub layers: Vec<Layer>,
     pub linetypes: Vec<Linetype>,
     pub text_styles: Vec<TextStyle>,
     pub dim_styles: Vec<DimStyle>,
     pub mleader_styles: Vec<MLeaderStyle>,
     pub table_styles: Vec<TableStyle>,
+    /// Multiline styles (MLSTYLE); STANDARD is always there.
+    pub mline_styles: Vec<MLineStyle>,
     pub blocks: BTreeMap<String, std::sync::Arc<Block>>,
     pub model: EntityStore,
     pub layouts: Vec<Layout>,
     pub views: Vec<NamedView>,
+    /// Model space viewport configurations (VPORTS): the tiles shown and named ones.
+    pub vports: Vec<VportConfig>,
     pub ucss: Vec<Ucs>,
     pub layer_states: Vec<LayerState>,
     pub groups: Vec<Group>,
+    /// Plot style tables kept with the drawing (STYLESMANAGER); they shadow built-in tables of
+    /// the same name.
+    pub plot_style_tables: Vec<PlotStyleTable>,
     /// Parametric constraints (GEOMCONSTRAINT / DIMCONSTRAINT).
     pub constraints: Vec<Constraint>,
     /// User parameters and parametric settings.
     pub parametric: Parametric,
+    /// The annotation scale list (SCALELISTEDIT).
+    pub scales: Vec<AnnoScale>,
     /// Next free handle.
     pub handseed: u64,
+    /// Objects hidden for this session by ISOLATEOBJECTS / HIDEOBJECTS. Never written to a file:
+    /// a drawing opens with everything shown again.
+    pub hidden_objects: BTreeSet<Handle>,
+    /// What reading the file left out (a DWG's object records the reader couldn't decode), told
+    /// to the user when the drawing opens. Never written to a file.
+    pub read_notes: Vec<String>,
+    /// The in-place block reference edit in progress (REFEDIT). Never written to a file; files are
+    /// written from [`Drawing::committed`].
+    pub refedit: Option<RefEdit>,
+    /// Records of the file this drawing was read from that the reader could not place (a damaged
+    /// file), counted by the section they came from. Never written to a file.
+    pub skipped_records: BTreeMap<String, usize>,
 }
 
 impl Default for Drawing {
@@ -89,6 +146,7 @@ impl Drawing {
     pub fn new_metric() -> Self {
         let mut d = Drawing::bare();
         d.header = Header::metric();
+        d.scales = metric_scales();
         d.dim_styles.push(DimStyle::iso25());
         d.header.set_str("DIMSTYLE", "ISO-25");
         d
@@ -96,6 +154,7 @@ impl Drawing {
     fn bare() -> Self {
         Drawing {
             header: Header::default(),
+            foreign: std::sync::Arc::default(),
             layers: vec![Layer::default(), Layer { name: "Defpoints".into(), plot: false, ..Layer::default() }],
             linetypes: vec![
                 Linetype { name: "ByBlock".into(), description: String::new(), pattern: Vec::new() },
@@ -106,16 +165,24 @@ impl Drawing {
             dim_styles: vec![DimStyle::default()],
             mleader_styles: vec![MLeaderStyle::default()],
             table_styles: vec![TableStyle::default()],
+            mline_styles: vec![MLineStyle::default()],
             blocks: BTreeMap::new(),
             model: EntityStore::new(),
             layouts: vec![Layout::new("Layout1", 1), Layout::new("Layout2", 2)],
             views: Vec::new(),
+            vports: Vec::new(),
             ucss: Vec::new(),
             layer_states: Vec::new(),
             groups: Vec::new(),
+            plot_style_tables: Vec::new(),
             constraints: Vec::new(),
             parametric: Parametric::default(),
+            scales: imperial_scales(),
             handseed: 0x100,
+            hidden_objects: BTreeSet::new(),
+            read_notes: Vec::new(),
+            refedit: None,
+            skipped_records: BTreeMap::new(),
         }
     }
 
@@ -146,6 +213,72 @@ impl Drawing {
     }
     pub fn dim_style(&self, name: &str) -> Option<&DimStyle> {
         self.dim_styles.iter().find(|l| l.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The DIM* variables in the header that differ from the current dimension style, as
+    /// [`DimStyle`] fields: AutoCAD's style overrides (set with SETVAR), which new dimensions
+    /// take on.
+    pub fn dim_overrides(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        let Some(st) = self.dim_style(&self.header.str("DIMSTYLE", "Standard")) else { return out };
+        let base = serde_json::to_value(st).unwrap_or_default();
+        for (var, field) in DIMVARS {
+            let Some(v) = self.header.get(var).and_then(|h| serde_json::to_value(h).ok()) else { continue };
+            let mut cand = st.clone();
+            if !cand.apply_fields(&serde_json::Map::from_iter([((*field).to_string(), v)])).is_empty() {
+                continue;
+            }
+            let Some(cv) = serde_json::to_value(&cand).ok().and_then(|c| c.get(*field).cloned()) else { continue };
+            let same = match (base.get(*field), &cv) {
+                // Text style and arrow block names compare without case.
+                (Some(serde_json::Value::String(a)), serde_json::Value::String(b))
+                    if matches!(
+                        *field,
+                        "textStyle"
+                            | "arrowBlock"
+                            | "arrowBlock1"
+                            | "arrowBlock2"
+                            | "leaderArrowBlock"
+                            | "dimLinetype"
+                            | "extLinetype1"
+                            | "extLinetype2"
+                    ) =>
+                {
+                    a.eq_ignore_ascii_case(b)
+                }
+                (b, cv) => b == Some(cv),
+            };
+            if !same {
+                out.insert((*field).to_string(), cv);
+            }
+        }
+        out
+    }
+
+    /// Set the header's DIM* variables to the current dimension style's values, clearing the
+    /// overrides (as making a style current or editing it does). Variables the header doesn't
+    /// carry stay absent; ones that can't hold the style's value are removed.
+    pub fn sync_dim_vars(&mut self) {
+        let Some(st) = self.dim_style(&self.header.str("DIMSTYLE", "Standard")) else { return };
+        let v = serde_json::to_value(st).unwrap_or_default();
+        for (var, field) in DIMVARS {
+            let Some(old) = self.header.get(var) else { continue };
+            let new = match (old, v.get(*field)) {
+                (HVal::Int(_), Some(serde_json::Value::Bool(b))) => Some(HVal::Int(i64::from(*b))),
+                (HVal::Int(_), Some(serde_json::Value::Number(n))) => {
+                    n.as_i64().or_else(|| n.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 1e15).map(|f| f as i64)).map(HVal::Int)
+                }
+                (HVal::Real(_), Some(serde_json::Value::Number(n))) => n.as_f64().map(HVal::Real),
+                (HVal::Str(_), Some(serde_json::Value::String(s))) => Some(HVal::Str(s.clone())),
+                _ => None,
+            };
+            match new {
+                Some(h) => self.header.set(var, h),
+                None => {
+                    self.header.vars.remove(*var);
+                }
+            }
+        }
     }
     pub fn block(&self, name: &str) -> Option<&std::sync::Arc<Block>> {
         self.blocks.get(name).or_else(|| self.blocks.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
@@ -205,9 +338,15 @@ impl Drawing {
         Ok(h)
     }
 
-    /// Effective visibility of an entity (its own flag, its layer on/thawed).
+    /// Effective visibility of an entity (its own flag, its layer on/thawed, not hidden by object
+    /// isolation).
     pub fn is_visible(&self, e: &Entity) -> bool {
-        e.common.visible && self.layer(&e.common.layer).is_none_or(Layer::visible)
+        e.common.visible && self.layer(&e.common.layer).is_none_or(Layer::visible) && !self.is_hidden_object(e.handle)
+    }
+
+    /// Whether ISOLATEOBJECTS / HIDEOBJECTS hid `h` for this session.
+    pub fn is_hidden_object(&self, h: Handle) -> bool {
+        !self.hidden_objects.is_empty() && self.hidden_objects.contains(&h)
     }
 
     /// Bounds of all visible entities in a space.
@@ -240,6 +379,9 @@ impl Drawing {
         }
     }
 }
+
+mod anno;
+pub use anno::*;
 
 #[cfg(test)]
 mod tests;

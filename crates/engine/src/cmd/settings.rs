@@ -3,7 +3,9 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::{Result, Session};
+use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+
+pub(super) mod iso;
 
 fn toggle(s: &mut Session, p: &Value, get: fn(&mut crate::Settings) -> &mut bool, name: &str) -> Result<Value> {
     let v = get(&mut s.settings);
@@ -56,11 +58,19 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo()
             .transparent(),
-        CommandSpec::new("isodraft", "Isometric Drafting", |s, p| toggle(s, p, |st| &mut st.isodraft, "Isodraft"))
-            .params("{on?: bool}")
+        CommandSpec::new("isodraft", "Isometric Drafting", iso::run_isodraft)
+            .params("{on?: bool, plane?: \"left\"|\"top\"|\"right\"|\"orthographic\"} (neither: toggle)")
             .enabled(always)
             .noundo()
-            .transparent(),
+            .transparent()
+            .interactive(|_| Ok(Box::new(iso::IsodraftM))),
+        CommandSpec::new("isoplane", "Isometric Plane", iso::run_isoplane)
+            .key("F5")
+            .params("{plane?: \"left\"|\"top\"|\"right\"} (none: the next plane)")
+            .enabled(always)
+            .noundo()
+            .transparent()
+            .interactive(|_| Ok(Box::new(iso::IsoplaneM))),
         CommandSpec::new("transparencydisplay", "Show/Hide Transparency", |s, p| toggle(s, p, |st| &mut st.transparency_display, "Transparency"))
             .params("{on?: bool}")
             .enabled(always)
@@ -85,13 +95,13 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Tools", "Drafting Settings..."])
             .alias(&["ds", "se"])
             .params("{snapunit?: [x,y], gridunit?: [x,y], polarang? (degrees), gridmajor?}")
-            .enabled(always)
-            .noundo(),
+            .enabled(always),
         CommandSpec::new("setvar", "Set Variable", run_setvar)
             .menu(&["Tools", "Inquiry", "Set Variable"])
             .alias(&["set"])
             .params("{name, value}")
-            .transparent(),
+            .transparent()
+            .interactive(|_| Ok(Box::new(SetvarM::default()))),
         CommandSpec::new("getvar", "Get Variable", run_getvar).params("{name}").enabled(always).noundo(),
         CommandSpec::new("sysvars", "List System Variables", |s, _| Ok(crate::sysvars::list(s))).enabled(always).noundo(),
     ]
@@ -142,10 +152,10 @@ fn run_osnap(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn run_dsettings(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = point_param(p, "snapunit").filter(|v| v.x > 0.0 && v.y > 0.0) {
-        s.settings.snapunit = v;
+        crate::sysvars::set(s, "SNAPUNIT", &json!([v.x, v.y]))?;
     }
-    if let Some(v) = point_param(p, "gridunit").filter(|v| v.x > 0.0 && v.y > 0.0) {
-        s.settings.gridunit = v;
+    if let Some(v) = point_param(p, "gridunit").filter(|v| v.x >= 0.0 && v.y >= 0.0) {
+        crate::sysvars::set(s, "GRIDUNIT", &json!([v.x, v.y]))?;
     }
     if let Some(a) = p.get("polarang").and_then(Value::as_f64).filter(|a| *a > 0.0) {
         s.settings.polarang = a.to_radians();
@@ -154,7 +164,7 @@ fn run_dsettings(s: &mut Session, p: &Value) -> Result<Value> {
         s.settings.gridmajor = (m as u32).clamp(1, 100);
     }
     s.touch();
-    Ok(serde_json::to_value(&s.settings).unwrap_or(Value::Null))
+    Ok(serde_json::to_value(s.drafting_settings()).unwrap_or(Value::Null))
 }
 
 fn run_setvar(s: &mut Session, p: &Value) -> Result<Value> {
@@ -163,6 +173,82 @@ fn run_setvar(s: &mut Session, p: &Value) -> Result<Value> {
     crate::sysvars::set(s, name, v)?;
     s.touch();
     Ok(json!({ "name": name.to_ascii_uppercase(), "value": crate::sysvars::get(s, name) }))
+}
+
+/// A system variable value as the command line shows it.
+fn show_value(v: &Value) -> String {
+    match v {
+        Value::String(t) => t.clone(),
+        Value::Array(a) => a.iter().map(show_value).collect::<Vec<_>>().join(","),
+        other => other.to_string(),
+    }
+}
+
+/// SETVAR at the command line: "Enter variable name or [?]", then "Enter new value for NAME <current>".
+#[derive(Default)]
+struct SetvarM {
+    name: Option<String>,
+}
+
+impl Interactive for SetvarM {
+    fn name(&self) -> &'static str {
+        "SETVAR"
+    }
+    fn prompt(&self, s: &Session) -> Prompt {
+        // Not a free-text prompt: Space ends the input, as it does for names and numbers.
+        let accept = Accept { number: true, ..Accept::TEXT };
+        match &self.name {
+            None => Prompt::new("Enter variable name", accept).kw(&["?"]),
+            Some(n) => {
+                let p = Prompt::new(format!("Enter new value for {n}"), accept);
+                match crate::sysvars::get(s, n) {
+                    Some(v) => p.default(show_value(&v)),
+                    None => p,
+                }
+            }
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match (self.name.clone(), i) {
+            (_, Input::Enter | Input::Cancel) => Ok(Step::Done),
+            (None, Input::Keyword(_)) => {
+                if let Value::Object(m) = crate::sysvars::list(s) {
+                    for (k, v) in m {
+                        s.echo(format!("{k:<12} {}", show_value(&v)));
+                    }
+                }
+                Ok(Step::Done)
+            }
+            (None, Input::Text(t)) => {
+                let n = t.trim().to_ascii_uppercase();
+                match crate::sysvars::get(s, &n) {
+                    None => {
+                        s.echo(format!("Unknown variable {n}. Type SETVAR ? to list variables."));
+                        Ok(Step::Done)
+                    }
+                    Some(v) if crate::sysvars::is_read_only(&n) => {
+                        s.echo(format!("{n} = {} (read only)", show_value(&v)));
+                        Ok(Step::Done)
+                    }
+                    Some(_) => {
+                        self.name = Some(n);
+                        Ok(Step::Continue)
+                    }
+                }
+            }
+            (Some(n), Input::Text(t)) => match crate::sysvars::set(s, &n, &Value::String(t)) {
+                Ok(()) => {
+                    s.touch();
+                    Ok(Step::Done)
+                }
+                Err(e) => {
+                    s.echo(e.to_string());
+                    Ok(Step::Continue)
+                }
+            },
+            _ => Ok(Step::Continue),
+        }
+    }
 }
 
 fn run_getvar(s: &mut Session, p: &Value) -> Result<Value> {

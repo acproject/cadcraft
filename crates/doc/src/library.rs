@@ -4,9 +4,12 @@
 //! The names follow the industry-common names users expect (DASHED, CENTER, ANSI31…); the
 //! dash and spacing values are our own.
 
-use crate::{DashElement, Linetype};
+use crate::{DashElement, Drawing, Linetype};
 
-/// The standard linetype library (inch-based lengths; metric drawings scale with LTSCALE).
+pub mod files;
+
+/// The standard linetype library, defined in inches. Load it into a drawing with
+/// [`standard_linetypes_for`], which scales it for metric drawings.
 pub fn standard_linetypes() -> Vec<Linetype> {
     let s = |name: &str, desc: &str, d: &[f64]| Linetype::simple(name, desc, d);
     vec![
@@ -32,8 +35,15 @@ pub fn standard_linetypes() -> Vec<Linetype> {
             description: "Fenceline circle ----0-----0----".into(),
             pattern: vec![
                 DashElement::dash(0.25),
+                // The text goes where its element ends: centred between the two gaps.
+                DashElement {
+                    text: Some("o".into()),
+                    style: Some("Standard".into()),
+                    scale: 0.1,
+                    offset: cadcraft_geom::Vec2::new(-0.035, -0.035),
+                    ..DashElement::dash(-0.1)
+                },
                 DashElement::dash(-0.1),
-                DashElement { text: Some("o".into()), scale: 0.1, ..DashElement::dash(-0.1) },
                 DashElement::dash(0.5),
             ],
         },
@@ -41,8 +51,33 @@ pub fn standard_linetypes() -> Vec<Linetype> {
     ]
 }
 
+/// The standard linetypes as loaded into `d`. In a metric drawing (`MEASUREMENT` 1) every length
+/// (dashes, gaps, text and shape size, offsets) is multiplied by 25.4, so the patterns measure
+/// in millimetres what they measure in inches in an imperial drawing (DASHED: 12.7 on, 6.35
+/// off) and LTSCALE 1 suits both, as CAD programs load ISO-scaled definitions for metric
+/// drawings. Definitions already in a drawing are not changed.
+pub fn standard_linetypes_for(d: &Drawing) -> Vec<Linetype> {
+    let lib = standard_linetypes();
+    if d.header.i64("MEASUREMENT", 0) != 1 {
+        return lib;
+    }
+    lib.into_iter().map(|lt| scaled(lt, 25.4)).collect()
+}
+
+/// `lt` with every length multiplied by `k`.
+fn scaled(mut lt: Linetype, k: f64) -> Linetype {
+    for e in &mut lt.pattern {
+        e.length *= k;
+        e.offset = e.offset * k;
+        if e.text.is_some() || e.shape.is_some() {
+            e.scale *= k;
+        }
+    }
+    lt
+}
+
 /// A hatch pattern line family: angle (degrees), origin, offset (shift along, spacing), dashes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PatternLine {
     pub angle: f64,
     pub origin: (f64, f64),
@@ -118,9 +153,11 @@ pub fn standard_patterns() -> Vec<HatchPattern> {
             name: "BRICK",
             description: "Brick or masonry-type surface",
             lines: vec![
+                // Running bond: courses 0.25 high, bricks 0.5 long. Each vertical family draws the
+                // joints of every other course, 0.5 apart; the second is offset half a brick.
                 pl(0.0, (0.0, 0.0), (0.0, 0.25), &[]),
-                pl(90.0, (0.0, 0.0), (0.25, 0.25), &[0.25, -0.25]),
-                pl(90.0, (0.25, 0.0), (0.25, 0.25), &[-0.25, 0.25]),
+                pl(90.0, (0.0, 0.0), (0.0, 0.5), &[0.25, -0.25]),
+                pl(90.0, (0.25, 0.0), (0.0, 0.5), &[-0.25, 0.25]),
             ],
         },
         HatchPattern {
@@ -168,28 +205,73 @@ pub fn standard_patterns() -> Vec<HatchPattern> {
             description: "Staircase effect",
             lines: vec![pl(0.0, (0.0, 0.0), (0.125, 0.125), &[0.125, -0.125]), pl(90.0, (0.125, 0.0), (0.125, 0.125), &[0.125, -0.125])],
         },
-        HatchPattern {
-            name: "AR-CONC",
-            description: "Random dot and stone pattern",
-            lines: vec![
-                pl(50.0, (0.0, 0.0), (0.4, 0.25), &[0.15, -0.6]),
-                pl(355.0, (0.0, 0.0), (0.27, 0.3), &[0.12, -0.5]),
-                pl(100.0, (0.12, 0.05), (0.35, 0.33), &[0.1, -0.55]),
-                pl(0.0, (0.07, 0.02), (0.21, 0.17), &[0.0, -0.4]),
-            ],
-        },
-        HatchPattern {
-            name: "AR-SAND",
-            description: "Random dot pattern",
-            lines: vec![
-                pl(37.5, (0.0, 0.0), (0.112, 0.0912), &[0.0, -0.22, 0.0, -0.14]),
-                pl(7.5, (0.0, 0.0), (0.157, 0.0724), &[0.0, -0.19, 0.0, -0.31]),
-                pl(-32.5, (0.0, 0.0), (0.091, 0.1312), &[0.0, -0.27, 0.0, -0.11]),
-            ],
-        },
+        // Drawn at the scale of the pattern CAD programs ship under this name (about 16x
+        // coarser than first drawn here: AR-CONC hatches came out hundreds of times too dense).
+        scaled_pattern(
+            HatchPattern {
+                name: "AR-CONC",
+                description: "Random dot and stone pattern",
+                lines: vec![
+                    pl(50.0, (0.0, 0.0), (0.4, 0.25), &[0.15, -0.6]),
+                    pl(355.0, (0.0, 0.0), (0.27, 0.3), &[0.12, -0.5]),
+                    pl(100.0, (0.12, 0.05), (0.35, 0.33), &[0.1, -0.55]),
+                    pl(0.0, (0.07, 0.02), (0.21, 0.17), &[0.0, -0.4]),
+                ],
+            },
+            16.0,
+        ),
+        // Drawn at the scale of the pattern CAD programs ship under this name (about 16x
+        // coarser than first drawn here: AR-CONC hatches came out hundreds of times too dense).
+        scaled_pattern(
+            HatchPattern {
+                name: "AR-SAND",
+                description: "Random dot pattern",
+                lines: vec![
+                    pl(37.5, (0.0, 0.0), (0.112, 0.0912), &[0.0, -0.22, 0.0, -0.14]),
+                    pl(7.5, (0.0, 0.0), (0.157, 0.0724), &[0.0, -0.19, 0.0, -0.31]),
+                    pl(-32.5, (0.0, 0.0), (0.091, 0.1312), &[0.0, -0.27, 0.0, -0.11]),
+                ],
+            },
+            16.0,
+        ),
     ]
 }
 
 pub fn pattern(name: &str) -> Option<HatchPattern> {
     standard_patterns().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
+}
+
+/// The library pattern `name` as drawn in `d`. In a metric drawing (`MEASUREMENT` 1) every
+/// length is multiplied by 25.4, as CAD programs use ISO-scaled pattern definitions there (as
+/// for linetypes, see [`standard_linetypes_for`]): a hatch at scale 1 measures in millimetres
+/// what it measures in inches in an imperial drawing.
+pub fn pattern_for(d: &Drawing, name: &str) -> Option<HatchPattern> {
+    let p = pattern(name)?;
+    Some(if d.header.i64("MEASUREMENT", 0) == 1 { scaled_pattern(p, 25.4) } else { p })
+}
+
+/// `p` with every length (origins, offsets, dashes) multiplied by `k`.
+fn scaled_pattern(mut p: HatchPattern, k: f64) -> HatchPattern {
+    for l in &mut p.lines {
+        l.origin = (l.origin.0 * k, l.origin.1 * k);
+        l.delta = (l.delta.0 * k, l.delta.1 * k);
+        for d in &mut l.dashes {
+            *d *= k;
+        }
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_drawings_draw_iso_scaled_patterns() {
+        let imp = pattern_for(&Drawing::new_imperial(), "ANSI31").map(|p| p.lines[0].delta.1);
+        let met = pattern_for(&Drawing::new_metric(), "ansi31").map(|p| p.lines[0].delta.1);
+        assert_eq!(imp, Some(0.125));
+        assert!(met.is_some_and(|m| (m - 0.125 * 25.4).abs() < 1e-12), "{met:?}");
+        assert!(pattern_for(&Drawing::new_metric(), "NOPE").is_none());
+    }
 }

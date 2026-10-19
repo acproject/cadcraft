@@ -38,6 +38,15 @@ pub fn polygon_vertices(center: Vec2, sides: usize, radius_pt: Vec2, inscribed: 
     (0..n).map(|i| PolyVertex::new(Vec2::polar(center, r, a0 + step * i as f64))).collect()
 }
 
+/// The radius point for a polygon whose radius is typed: the bottom edge is horizontal in both
+/// modes (inscribed: a vertex half a side's angle past straight down; circumscribed: the bottom
+/// edge's midpoint straight down).
+pub fn polygon_typed_radius_point(center: Vec2, sides: usize, radius: f64, inscribed: bool) -> Vec2 {
+    let down = -std::f64::consts::FRAC_PI_2;
+    let a = if inscribed { down + std::f64::consts::PI / sides.clamp(3, 1024) as f64 } else { down };
+    Vec2::polar(center, radius, a)
+}
+
 /// Polygon from an edge (first two vertices).
 pub fn polygon_from_edge(p1: Vec2, p2: Vec2, sides: usize) -> Vec<PolyVertex> {
     let n = sides.clamp(3, 1024);
@@ -90,4 +99,44 @@ pub fn rect_with_corners(a: Vec2, b: Vec2, fillet: f64, chamfer: (f64, f64)) -> 
         .collect();
     }
     rect_vertices(Vec2::new(x0, y0), Vec2::new(x1, y1))
+}
+
+// ---------- the user's support files ----------
+
+/// Largest support file (linetype, hatch pattern or alias file) read.
+pub const MAX_SUPPORT_FILE_BYTES: u64 = 8 << 20;
+
+/// The text of a support file the user gives: a path in `{path_key}` (read from disk; the web has
+/// no file system) or the contents in `{text_key}`. Returns the text and a name for messages, or
+/// `None` when neither is given. Files over [`MAX_SUPPORT_FILE_BYTES`] are refused; bytes that
+/// aren't UTF-8 are read as replacement characters.
+pub fn support_text(cmd: &str, p: &serde_json::Value, path_key: &str, text_key: &str) -> crate::Result<Option<(String, String)>> {
+    if let Some(text) = p.get(text_key).and_then(serde_json::Value::as_str) {
+        if text.len() as u64 > MAX_SUPPORT_FILE_BYTES {
+            return Err(super::bad(cmd, format!("`{text_key}` is larger than {} MB", MAX_SUPPORT_FILE_BYTES >> 20)));
+        }
+        return Ok(Some((text.to_string(), "the given text".into())));
+    }
+    match p.get(path_key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(path)) => Ok(Some((read_support_file(cmd, path)?, path.clone()))),
+        Some(_) => Err(super::bad(cmd, format!("`{path_key}` must be a file path"))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_support_file(cmd: &str, path: &str) -> crate::Result<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| super::bad(cmd, format!("{path}: {e}")))?;
+    let mut bytes = Vec::new();
+    f.take(MAX_SUPPORT_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|e| super::bad(cmd, format!("{path}: {e}")))?;
+    if bytes.len() as u64 > MAX_SUPPORT_FILE_BYTES {
+        return Err(super::bad(cmd, format!("{path}: larger than {} MB", MAX_SUPPORT_FILE_BYTES >> 20)));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_support_file(cmd: &str, _path: &str) -> crate::Result<String> {
+    Err(super::bad(cmd, "paths are not available on the web; pass the file's contents"))
 }

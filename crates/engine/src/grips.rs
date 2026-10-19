@@ -5,7 +5,7 @@
 //! undoable and reachable from scripts, the control channel and MCP.
 
 use cadcraft_doc::{DimKind, EntityKind, Handle, LwPolyline};
-use cadcraft_geom::{Arc, EPS, Mat3, Polyline, Spline, Vec2, Vec3, norm_angle};
+use cadcraft_geom::{Arc, EPS, Mat3, Polyline, Vec2, Vec3, norm_angle};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -84,6 +84,20 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
     let from = *grips.get(index)?;
     let delta = to - from;
     let mut k = kind.clone();
+    // The further parts of a broken table move on their own.
+    if index > 0
+        && let EntityKind::Table(t) = &mut k
+        && let Some(b) = &mut t.breaks
+    {
+        let i = index - 1;
+        if b.offsets.len() <= i {
+            b.offsets.resize(i + 1, Vec2::ZERO);
+        }
+        if let Some(o) = b.offsets.get_mut(i) {
+            *o += delta;
+        }
+        return Some(k);
+    }
     match &mut k {
         EntityKind::Line(l) => match index {
             0 => set_xy(&mut l.a, to),
@@ -93,7 +107,7 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
         EntityKind::Point(_) | EntityKind::Text(_) | EntityKind::MText(_) | EntityKind::AttDef(_) | EntityKind::Image(_) | EntityKind::Table(_) => {
             return Some(translated(kind, delta));
         }
-        EntityKind::Hatch(_) => return Some(translated(kind, delta)),
+        EntityKind::Hatch(_) | EntityKind::Tolerance(_) => return Some(translated(kind, delta)),
         EntityKind::Circle(c) => {
             if index == 0 {
                 return Some(translated(kind, delta));
@@ -181,12 +195,22 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
             } else {
                 let mut fit = sp.fit.clone();
                 *fit.get_mut(index)? = to;
-                let closed = sp.closed;
-                let mut n = Spline::from_fit_points(&fit);
-                n.closed = closed;
-                *sp = n;
+                *sp = sp.refit(&fit, sp.closed);
             }
         }
+        // Centre, base radius (and start angle), top radius.
+        EntityKind::Helix(h) => match index {
+            0 => return Some(translated(kind, delta)),
+            1 => {
+                let r = h.center.xy().dist(to);
+                if r <= EPS {
+                    return None;
+                }
+                h.base_radius = r;
+                h.start_angle = h.center.xy().angle_to(to);
+            }
+            _ => h.top_radius = h.center.xy().dist(to),
+        },
         EntityKind::Ray(r) | EntityKind::XLine(r) => {
             if index == 0 {
                 return Some(translated(kind, delta));
@@ -227,6 +251,7 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
             d.block = None;
         }
         EntityKind::Leader(l) => set_xy(l.vertices.get_mut(index)?, to),
+        EntityKind::MLine(m) => set_xy(&mut m.vertices.get_mut(index)?.p, to),
         EntityKind::MLeader(m) => {
             let mut idx = 0usize;
             let mut done = false;
@@ -241,17 +266,22 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
                 }
             }
             if !done {
-                // The landing grip moves the landing and its text.
+                // The landing grip moves the landing and its content.
                 let ld = m.landing.xy() + delta;
                 set_xy(&mut m.landing, ld);
                 if let Some(t) = &mut m.text {
                     let q = t.insert.xy() + delta;
                     set_xy(&mut t.insert, q);
                 }
+                if let Some(b) = &mut m.block {
+                    let q = b.insert.xy() + delta;
+                    set_xy(&mut b.insert, q);
+                }
             }
         }
         EntityKind::Solid(s) | EntityKind::Trace(s) => set_xy(s.corners.get_mut(index)?, to),
         EntityKind::Face3d(f) => set_xy(f.corners.get_mut(index)?, to),
+        EntityKind::Region(_) => return Some(translated(kind, delta)),
         EntityKind::Viewport(v) => {
             let opposite = *grips.get((index + 2) % 4)?;
             let w = (to.x - opposite.x).abs();
@@ -278,6 +308,190 @@ fn shift_params(e: &mut cadcraft_doc::Ellipse, by: f64) {
     }
 }
 
+/// A multifunctional grip option besides Stretch (the menu a polyline, line or arc grip shows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GripAction {
+    /// Polyline: insert a vertex after this vertex, or on this segment.
+    AddVertex,
+    /// Polyline: remove this vertex.
+    RemoveVertex,
+    /// Polyline: make this straight segment an arc through a picked point.
+    ToArc,
+    /// Polyline: make this arc segment straight.
+    ToLine,
+    /// Line or arc end: lengthen or shorten the object along itself.
+    Lengthen,
+    /// Arc midpoint: change the radius, keeping the center and angles.
+    Radius,
+}
+
+impl GripAction {
+    /// The command-line keyword at the hot-grip prompt.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            GripAction::AddVertex => "Add vertex",
+            GripAction::RemoveVertex => "Remove vertex",
+            GripAction::ToArc => "conVert to arc",
+            GripAction::ToLine => "conVert to line",
+            GripAction::Lengthen => "Lengthen",
+            GripAction::Radius => "Radius",
+        }
+    }
+    /// The grip menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            GripAction::AddVertex => "Add Vertex",
+            GripAction::RemoveVertex => "Remove Vertex",
+            GripAction::ToArc => "Convert to Arc",
+            GripAction::ToLine => "Convert to Line",
+            GripAction::Lengthen => "Lengthen",
+            GripAction::Radius => "Radius",
+        }
+    }
+    /// The mode name on the command line ("** ADD VERTEX **").
+    pub fn title(self) -> &'static str {
+        match self {
+            GripAction::AddVertex => "** ADD VERTEX **",
+            GripAction::RemoveVertex => "** REMOVE VERTEX **",
+            GripAction::ToArc => "** CONVERT TO ARC **",
+            GripAction::ToLine => "** CONVERT TO LINE **",
+            GripAction::Lengthen => "** LENGTHEN **",
+            GripAction::Radius => "** RADIUS **",
+        }
+    }
+    /// Whether the option needs a point (or value); the others act at once.
+    pub fn needs_point(self) -> bool {
+        !matches!(self, GripAction::RemoveVertex | GripAction::ToLine)
+    }
+}
+
+/// The multifunctional options of grip `index` of `kind` (empty when it has only Stretch):
+/// polyline vertices Add/Remove Vertex, polyline segment midpoints Add Vertex and Convert to
+/// Arc/Line, line and arc ends Lengthen, the arc midpoint Radius.
+pub fn grip_actions(kind: &EntityKind, index: usize) -> Vec<GripAction> {
+    match kind {
+        EntityKind::LwPolyline(p) => match poly_grip(p, index) {
+            Some(PolyGrip::Vertex(_)) if p.vertices.len() > 2 => vec![GripAction::AddVertex, GripAction::RemoveVertex],
+            Some(PolyGrip::Vertex(_)) => vec![GripAction::AddVertex],
+            Some(PolyGrip::Mid(i)) => {
+                let arc = p.vertices.get(i).is_some_and(|v| v.bulge.abs() > 1e-12);
+                vec![GripAction::AddVertex, if arc { GripAction::ToLine } else { GripAction::ToArc }]
+            }
+            None => Vec::new(),
+        },
+        EntityKind::Line(_) if index == 0 || index == 2 => vec![GripAction::Lengthen],
+        EntityKind::Arc(_) if index == 0 || index == 2 => vec![GripAction::Lengthen],
+        EntityKind::Arc(_) if index == 1 => vec![GripAction::Radius],
+        _ => Vec::new(),
+    }
+}
+
+/// The object after the multifunctional `action` on grip `index`, with the picked point `to`
+/// (Add Vertex: the new vertex; Convert to Arc: a point on the arc; Lengthen: the new end,
+/// projected onto the object; Radius: a point on the new circle) or the typed `value` (Lengthen:
+/// the change in length; Radius: the new radius). `None` when the option doesn't apply or the
+/// result would be degenerate.
+pub fn grip_action(kind: &EntityKind, index: usize, action: GripAction, to: Option<Vec2>, value: Option<f64>) -> Option<EntityKind> {
+    if !grip_actions(kind, index).contains(&action) || to.is_some_and(|p| !p.is_finite()) || value.is_some_and(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut k = kind.clone();
+    match (&mut k, action) {
+        (EntityKind::LwPolyline(p), GripAction::AddVertex) => {
+            let to = to?;
+            let at = match poly_grip(p, index)? {
+                PolyGrip::Vertex(i) | PolyGrip::Mid(i) => i,
+            };
+            if at >= p.vertices.len() {
+                return None;
+            }
+            let v = p.vertices.get_mut(at)?;
+            // The segment is split in two straight ones.
+            v.bulge = 0.0;
+            let nv = cadcraft_geom::PolyVertex { p: to, bulge: 0.0, ..*v };
+            p.vertices.insert(at + 1, nv);
+        }
+        (EntityKind::LwPolyline(p), GripAction::RemoveVertex) => {
+            let PolyGrip::Vertex(i) = poly_grip(p, index)? else { return None };
+            if p.vertices.len() <= 2 || i >= p.vertices.len() {
+                return None;
+            }
+            p.vertices.remove(i);
+            // The segment into the removed vertex now runs to the next one: straight.
+            let n = p.vertices.len();
+            let prev = if i == 0 { if p.closed { n - 1 } else { return Some(k) } } else { i - 1 };
+            p.vertices.get_mut(prev)?.bulge = 0.0;
+        }
+        (EntityKind::LwPolyline(p), GripAction::ToArc) => {
+            let PolyGrip::Mid(i) = poly_grip(p, index)? else { return None };
+            let j = (i + 1) % p.vertices.len().max(1);
+            let (a, b) = (p.vertices.get(i)?.p, p.vertices.get(j)?.p);
+            let bulge = crate::cmd::curves::bulge_through(a, to?, b);
+            if bulge.abs() < 1e-12 || !bulge.is_finite() {
+                return None;
+            }
+            p.vertices.get_mut(i)?.bulge = bulge;
+        }
+        (EntityKind::LwPolyline(p), GripAction::ToLine) => {
+            let PolyGrip::Mid(i) = poly_grip(p, index)? else { return None };
+            p.vertices.get_mut(i)?.bulge = 0.0;
+        }
+        (EntityKind::Line(l), GripAction::Lengthen) => {
+            let (fixed, end) = if index == 0 { (l.b.xy(), l.a.xy()) } else { (l.a.xy(), l.b.xy()) };
+            let len = fixed.dist(end);
+            let dir = (end - fixed).normalized();
+            if dir == Vec2::ZERO {
+                return None;
+            }
+            let new_len = match (value, to) {
+                (Some(d), _) => len + d,
+                (None, Some(p)) => (p - fixed).dot(dir),
+                _ => return None,
+            };
+            if !(new_len > EPS && new_len.is_finite()) {
+                return None;
+            }
+            let q = fixed + dir * new_len;
+            set_xy(if index == 0 { &mut l.a } else { &mut l.b }, q);
+        }
+        (EntityKind::Arc(a), GripAction::Lengthen) => {
+            let c = a.center.xy();
+            let ang = match (value, to) {
+                (Some(d), _) if a.radius > EPS => {
+                    let da = d / a.radius;
+                    if index == 0 { a.start - da } else { a.end + da }
+                }
+                (None, Some(p)) if !p.near(c, EPS) => c.angle_to(p),
+                _ => return None,
+            };
+            let ang = norm_angle(ang);
+            if index == 0 {
+                a.start = ang;
+            } else {
+                a.end = ang;
+            }
+            let sweep = cadcraft_geom::ccw_sweep(a.start, a.end);
+            if !(sweep > 1e-9 && sweep < cadcraft_geom::TAU - 1e-9) {
+                return None;
+            }
+        }
+        (EntityKind::Arc(a), GripAction::Radius) => {
+            let r = match (value, to) {
+                (Some(r), _) => r,
+                (None, Some(p)) => a.center.xy().dist(p),
+                _ => return None,
+            };
+            if !(r > EPS && r.is_finite()) {
+                return None;
+            }
+            a.radius = r;
+        }
+        _ => return None,
+    }
+    Some(k)
+}
+
 /// The transform for a multi-functional grip mode about `base` with the dragged point `to`.
 pub fn mode_matrix(mode: GripMode, base: Vec2, to: Vec2) -> Option<Mat3> {
     match mode {
@@ -294,21 +508,20 @@ pub fn mode_matrix(mode: GripMode, base: Vec2, to: Vec2) -> Option<Mat3> {
 
 impl Session {
     /// Drag grip `grip_index` of `handle` to `new_point` in `mode` (one undo step).
-    /// The base point of the rotate/scale/mirror modes is the grip itself.
+    /// The base point of the rotate/scale/mirror modes is the grip itself. As in AutoCAD the edit
+    /// covers the selection: a stretch drags the grips of other selected objects that sit on the
+    /// same point, and the other modes transform every selected object.
     pub fn grip_edit(&mut self, handle: Handle, grip_index: usize, new_point: Vec2, mode: GripMode) -> Result<()> {
         let to = [new_point.x, new_point.y];
+        let hs: Vec<String> = std::iter::once(handle).chain(self.selection().into_iter().filter(|h| *h != handle)).map(|h| h.hex()).collect();
         let r = match mode {
-            GripMode::Stretch => self.execute("grip.move", &json!({ "handle": handle.hex(), "index": grip_index, "to": to })),
-            GripMode::Move => self.execute("grip.move", &json!({ "handles": [handle.hex()], "index": grip_index, "to": to, "mode": "move" })),
-            GripMode::Rotate => {
-                self.execute("grip.rotate", &json!({ "handles": [handle.hex()], "baseHandle": handle.hex(), "index": grip_index, "to": to }))
+            GripMode::Stretch => self.execute("grip.move", &json!({ "handle": handle.hex(), "handles": hs, "index": grip_index, "to": to })),
+            GripMode::Move => {
+                self.execute("grip.move", &json!({ "handles": hs, "baseHandle": handle.hex(), "index": grip_index, "to": to, "mode": "move" }))
             }
-            GripMode::Scale => {
-                self.execute("grip.scale", &json!({ "handles": [handle.hex()], "baseHandle": handle.hex(), "index": grip_index, "to": to }))
-            }
-            GripMode::Mirror => {
-                self.execute("grip.mirror", &json!({ "handles": [handle.hex()], "baseHandle": handle.hex(), "index": grip_index, "to": to }))
-            }
+            GripMode::Rotate => self.execute("grip.rotate", &json!({ "handles": hs, "baseHandle": handle.hex(), "index": grip_index, "to": to })),
+            GripMode::Scale => self.execute("grip.scale", &json!({ "handles": hs, "baseHandle": handle.hex(), "index": grip_index, "to": to })),
+            GripMode::Mirror => self.execute("grip.mirror", &json!({ "handles": hs, "baseHandle": handle.hex(), "index": grip_index, "to": to })),
         };
         r.map(|_| ())
     }

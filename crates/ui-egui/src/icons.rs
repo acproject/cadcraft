@@ -3,6 +3,7 @@
 //! Icons are line drawings on a 24×24 design grid: light strokes for existing geometry, blue for
 //! the geometry a command creates and orange dots for picked points.
 
+use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2};
 
 use crate::theme::Tokens;
@@ -118,6 +119,7 @@ pub enum Icon {
     Annotation,
     Workspace,
     ChevronDown,
+    ChevronUp,
     ChevronLeft,
     ChevronRight,
     Plus,
@@ -139,6 +141,9 @@ pub enum Icon {
     Distance,
     Area,
     List,
+    PickAdd,
+    SelectObjects,
+    QuickSelect,
 }
 
 struct Pen<'a> {
@@ -790,6 +795,7 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
             pen.l(9.0, 9.0, 21.0, 9.0);
         }
         ChevronDown => pen.poly(&[(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)], false, b),
+        ChevronUp => pen.poly(&[(6.0, 15.0), (12.0, 9.0), (18.0, 15.0)], false, b),
         ChevronLeft => pen.poly(&[(15.0, 6.0), (9.0, 12.0), (15.0, 18.0)], false, b),
         ChevronRight => pen.poly(&[(9.0, 6.0), (15.0, 12.0), (9.0, 18.0)], false, b),
         Plus => {
@@ -883,18 +889,68 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
                 pen.l(8.0, y, 20.0, y);
             }
         }
+        PickAdd => {
+            // An object box with a plus: picks add to the selection.
+            pen.rect(3.0, 3.0, 11.0, 11.0, b);
+            pen.la(17.0, 11.0, 17.0, 21.0);
+            pen.la(12.0, 16.0, 22.0, 16.0);
+        }
+        SelectObjects => {
+            // A pointer picking an object box.
+            pen.rect(12.0, 3.0, 9.0, 9.0, a);
+            pen.poly(&[(4.0, 6.0), (4.0, 20.0), (7.5, 16.5), (10.5, 21.5), (12.5, 20.5), (9.5, 15.5), (14.0, 15.0)], true, b);
+        }
+        QuickSelect => {
+            // A filter funnel with a spark.
+            pen.poly(&[(3.0, 4.0), (19.0, 4.0), (13.0, 11.0), (13.0, 19.0), (9.0, 17.0), (9.0, 11.0)], true, b);
+            pen.poly(&[(20.0, 10.0), (16.5, 15.5), (20.0, 15.5), (17.0, 21.0)], false, a);
+        }
     }
 }
 
-/// Small helper: an icon button that returns `true` when clicked.
+/// A shared button interaction with CADCraft's original multicolor icon painting.
 pub fn button(ui: &mut egui::Ui, icon: Icon, size: f32, tooltip: &str, selected: bool) -> egui::Response {
     let t = Tokens::get();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
-    if selected {
-        ui.painter().rect_filled(rect, 3.0, t.tab_active);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 3.0, t.control_hover.gamma_multiply(0.6));
+    let visuals = |fill| ButtonVisuals { fill, stroke: Stroke::NONE, icon: t.icon };
+    let style = IconButtonStyle {
+        normal: visuals(Color32::TRANSPARENT),
+        hovered: visuals(t.control_hover.gamma_multiply(0.6)),
+        pressed: None,
+        selected: visuals(t.tab_active),
+        corner_radius: egui::CornerRadius::same(3),
+        focus_stroke: Stroke::new(1.0, t.accent),
+    };
+    let resp = IconButton::new(crate::i18n::t(tooltip), egui::vec2(size, size), &style).selected(selected).show(ui, |ui, rect, _| {
+        // A single tint would erase the blue geometry and orange picked points. Keep the
+        // original painter and its explicit dimming on the same parent-enabled UI.
+        paint(ui.painter(), rect.shrink(size * 0.08), icon, !ui.is_enabled());
+    });
+    crate::control::record_widget(ui, &resp, tooltip, "button", Some(selected));
+    resp.on_hover_text(crate::i18n::t(tooltip))
+}
+
+/// Labels and focus outlines for controls whose existing geometry is painted by the app.
+/// Pointer focus is opt-in for navigation tabs; drafting buttons keep their command-line flow.
+pub fn describe_control(ui: &egui::Ui, response: &egui::Response, label: &str, selected: Option<bool>, tab: bool) {
+    let label = crate::i18n::t(label);
+    response.widget_info(|| match selected {
+        Some(selected) => egui::WidgetInfo::selected(egui::WidgetType::Button, response.enabled(), selected, label),
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label),
+    });
+    if tab {
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_role(egui::accesskit::Role::Tab);
+            node.clear_toggled();
+            if let Some(selected) = selected {
+                node.set_selected(selected);
+            }
+        });
+        if response.clicked() {
+            response.request_focus();
+        }
     }
-    paint(ui.painter(), rect.shrink(size * 0.08), icon, !ui.is_enabled());
-    resp.on_hover_text(tooltip)
+    if response.has_focus() && response.rect.width() > 4.0 && response.rect.height() > 4.0 {
+        ui.painter().rect_stroke(response.rect.shrink(2.0), 2.0, Stroke::new(1.0, Tokens::get().accent), egui::StrokeKind::Inside);
+    }
+    crate::control::record_widget(ui, response, label, if tab { "tab" } else { "button" }, selected);
 }

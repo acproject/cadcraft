@@ -14,6 +14,11 @@ use super::machines::{SelOutcome, SelectPhase, number};
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
+mod curve_edits;
+mod fillet_pline;
+pub(crate) use curve_edits::join_curves;
+pub(crate) use fillet_pline::{ChamferDistances, fillet_pline};
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("pedit", "Polyline", run_pedit)
@@ -21,13 +26,18 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["pe"])
             .params(
                 "{handle | handles, option: close|open|join|width|fit|spline|decurve|reverse|ltypegen|vertex, width?, handles2? (join), fuzz?, \
-                 action?: move|insert|straighten|width, index?, to?, startWidth?, endWidth?, convert?: bool}",
+                 action?: move|insert|straighten|break|width|regen, index?, index2? (straighten, break), to?, startWidth?, endWidth?, \
+                 tangents?: [{index, angle (deg) | direction}] (fit), convert?: bool}",
             )
             .interactive(|_| Ok(Box::new(PeditM::default()))),
         CommandSpec::new("splinedit", "Spline", run_splinedit)
             .menu(&["Modify", "Object", "Spline"])
             .alias(&["spe"])
-            .params("{handle, option: close|open|reverse|refit|purge|polyline|move, fit?, index?, to?, precision?}")
+            .params(
+                "{handle, option: close|open|join|reverse|refit|purge|polyline|move|fitmove|fitadd|fitdelete|kink|tangents|tolerance|vertexadd|vertexmove|vertexdelete|weight|elevate, \
+                 handles2? (join), fit?, index?, to?, before?: bool (fitadd), at? (kink, vertexadd), start?, end? (tangent directions; null = default), tolerance?, weight?, \
+                 order? (elevate), precision?}",
+            )
             .interactive(|_| Ok(Box::new(SplineditM::default()))),
         CommandSpec::new("lengthen", "Lengthen", run_lengthen)
             .menu(&["Modify", "Lengthen"])
@@ -105,8 +115,9 @@ pub(crate) fn as_lwpoly(k: &EntityKind) -> Option<LwPolyline> {
     }
 }
 
-/// Fit curve: a tangent-continuous pair of arcs (biarc) per segment through every vertex.
-pub(crate) fn fit_vertices(vs: &[PolyVertex], closed: bool) -> Vec<PolyVertex> {
+/// Fit curve: a tangent-continuous pair of arcs (biarc) per segment through every vertex,
+/// following the tangent directions given per vertex (Edit vertex Tangent).
+pub(crate) fn fit_vertices(vs: &[PolyVertex], closed: bool, tans: &[Option<Vec2>]) -> Vec<PolyVertex> {
     let pts: Vec<Vec2> = vs.iter().map(|v| v.p).collect();
     let n = pts.len();
     if n < 3 {
@@ -128,6 +139,9 @@ pub(crate) fn fit_vertices(vs: &[PolyVertex], closed: bool) -> Vec<PolyVertex> {
     };
     // Open ends: mirror the neighbouring tangent across the chord for a natural end.
     let tan_at = |i: usize| -> Vec2 {
+        if let Some(Some(t)) = tans.get(i) {
+            return *t;
+        }
         if closed || (i != 0 && i + 1 != n) {
             return tangent(i);
         }
@@ -285,7 +299,7 @@ fn pedit_apply(s: &mut Session, h: Handle, opt: &str, p: &Value) -> Result<Value
                 v.end_width = 0.0;
             }
         }
-        "fit" | "f" => pl.vertices = fit_vertices(&pl.vertices, pl.closed),
+        "fit" | "f" => pl.vertices = fit_vertices(&pl.vertices, pl.closed, &pedit_vertex::tangent_param(p, pl.vertices.len())?),
         "spline" | "s" => {
             let segs = s.doc()?.header.i64("SPLINESEGS", 8).clamp(1, 64) as usize;
             pl.vertices = spline_vertices(&pl.vertices, pl.closed, segs);
@@ -328,10 +342,16 @@ fn pedit_apply(s: &mut Session, h: Handle, opt: &str, p: &Value) -> Result<Value
                     pl.vertices.insert(i + 1, PolyVertex::new(to));
                 }
                 "straighten" => {
-                    if let Some(v) = pl.vertices.get_mut(i) {
-                        v.bulge = 0.0;
-                    }
+                    let j = p.get("index2").and_then(Value::as_u64).map_or(i, |j| j as usize);
+                    pedit_vertex::straighten(&mut pl, i, j)?;
                 }
+                "break" => {
+                    let j = p.get("index2").and_then(Value::as_u64).map_or(i, |j| j as usize);
+                    let hs = pedit_vertex::break_poly(s, h, &pl, i, j)?;
+                    return Ok(json!({ "handle": h.hex(), "handles": hs.iter().map(|h| h.hex()).collect::<Vec<_>>() }));
+                }
+                // The display is always current; tangents only exist within an interactive PEDIT.
+                "regen" => {}
                 "width" => {
                     let sw = f64_or(p, "startWidth", 0.0).max(0.0);
                     let ew = f64_or(p, "endWidth", sw).max(0.0);
@@ -340,7 +360,7 @@ fn pedit_apply(s: &mut Session, h: Handle, opt: &str, p: &Value) -> Result<Value
                         v.end_width = ew;
                     }
                 }
-                _ => return Err(bad("pedit", "action must be move, insert, straighten or width")),
+                _ => return Err(bad("pedit", "action must be move, insert, straighten, break, width or regen")),
             }
         }
         _ => return Err(bad("pedit", "unknown option")),
@@ -375,7 +395,12 @@ enum PPhase {
     VInsert,
     VWidthStart,
     VWidthEnd,
+    /// The second marker of Break / Straighten.
+    VMark,
+    VTangent,
 }
+
+mod pedit_vertex;
 
 #[derive(Default)]
 struct PeditM {
@@ -386,6 +411,13 @@ struct PeditM {
     join: SelectPhase,
     vertex: usize,
     vwidth: f64,
+    /// Break / Straighten: the second marked vertex, and which of the two runs.
+    mark2: usize,
+    breaking: bool,
+    /// Edit vertex Tangent directions by vertex position, used by Fit.
+    tangents: Vec<(Vec2, Vec2)>,
+    /// Pieces split off by Break, with the history length after it (erased again by Undo).
+    split_off: Vec<(usize, Vec<Handle>)>,
 }
 
 impl PeditM {
@@ -422,10 +454,17 @@ impl Interactive for PeditM {
         let sel = s.selection();
         if let [h] = sel.as_slice() {
             let k = curves::entity(s, *h)?.kind;
-            if matches!(k, EntityKind::LwPolyline(_)) {
-                self.h = Some(*h);
-                self.original = self.poly(s).map(|p| p.vertices);
-                self.phase = PPhase::Main;
+            match k {
+                EntityKind::LwPolyline(_) => {
+                    self.h = Some(*h);
+                    self.original = self.poly(s).map(|p| p.vertices);
+                    self.phase = PPhase::Main;
+                }
+                EntityKind::Line(_) | EntityKind::Arc(_) => {
+                    self.h = Some(*h);
+                    self.phase = PPhase::Convert;
+                }
+                _ => {}
             }
         }
         Ok(Step::Continue)
@@ -461,6 +500,9 @@ impl Interactive for PeditM {
             PPhase::VInsert => Prompt::new("Specify location for new vertex", Accept::POINT),
             PPhase::VWidthStart => Prompt::new("Specify starting width for next segment", Accept::NUMBER),
             PPhase::VWidthEnd => Prompt::new("Specify ending width for next segment", Accept::NUMBER).default(format!("{:.4}", self.vwidth)),
+            PPhase::VMark => Prompt::new("Enter an option", curves::KW).kw(&["Next", "Previous", "Go", "eXit"]).default("N"),
+            PPhase::VTangent => Prompt::new("Specify direction of vertex tangent", Accept::POINT_OR_NUMBER)
+                .base_opt(self.poly(s).and_then(|p| p.vertices.get(self.vertex).map(|v| v.p))),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -525,7 +567,7 @@ impl Interactive for PeditM {
                         self.vertex = 0;
                         self.phase = PPhase::Vertex;
                     }
-                    "fit" | "f" => self.apply(s, "fit", json!({}))?,
+                    "fit" | "f" => self.apply(s, "fit", json!({ "tangents": self.tangents_json(s) }))?,
                     "spline" | "s" => self.apply(s, "spline", json!({}))?,
                     "decurve" | "d" => {
                         // Within the session, Decurve restores the frame before Fit/Spline.
@@ -545,6 +587,7 @@ impl Interactive for PeditM {
                     "ltype gen" | "l" => self.apply(s, "ltypegen", json!({}))?,
                     "reverse" | "r" => self.apply(s, "reverse", json!({}))?,
                     "undo" | "u" => {
+                        self.undo_split(s)?;
                         if let (Some(h), Some(k)) = (self.h, self.history.pop()) {
                             set_kind(s, h, k)?;
                         }
@@ -585,13 +628,18 @@ impl Interactive for PeditM {
                     "previous" | "p" => self.vertex = (self.vertex + n - 1) % n,
                     "move" | "m" => self.phase = PPhase::VMove,
                     "insert" | "i" => self.phase = PPhase::VInsert,
-                    "straighten" | "s" => {
-                        self.apply(s, "vertex", json!({ "action": "straighten", "index": self.vertex }))?;
+                    "straighten" | "s" | "break" | "b" => {
+                        self.breaking = k.starts_with('b');
+                        self.mark2 = self.vertex;
+                        self.phase = PPhase::VMark;
                     }
+                    "tangent" | "t" => self.phase = PPhase::VTangent,
+                    // The display is always current.
+                    "regen" | "r" => {}
                     "width" | "w" => self.phase = PPhase::VWidthStart,
                     "exit" | "x" => self.phase = PPhase::Main,
                     "" => {}
-                    other_k => s.echo(format!("{other_k}: not available yet")),
+                    _ => return Err(other("Invalid option keyword.")),
                 }
                 Ok(Step::Continue)
             }
@@ -615,6 +663,15 @@ impl Interactive for PeditM {
                 }
                 Ok(Step::Continue)
             }
+            PPhase::VMark => {
+                let k = kw(&i).unwrap_or_else(|| if i == Input::Enter { "n".into() } else { String::new() });
+                self.mark_input(s, &k)?;
+                Ok(Step::Continue)
+            }
+            PPhase::VTangent => {
+                self.tangent_input(s, &i)?;
+                Ok(Step::Continue)
+            }
             PPhase::VWidthEnd => {
                 let ew = match &i {
                     Input::Text(t) => number(t).filter(|w| *w >= 0.0).ok_or_else(|| other("Requires a non-negative width."))?,
@@ -627,14 +684,20 @@ impl Interactive for PeditM {
         }
     }
     fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
-        if !matches!(self.phase, PPhase::Vertex | PPhase::VMove | PPhase::VInsert | PPhase::VWidthStart | PPhase::VWidthEnd) {
+        if !matches!(
+            self.phase,
+            PPhase::Vertex | PPhase::VMove | PPhase::VInsert | PPhase::VWidthStart | PPhase::VWidthEnd | PPhase::VMark | PPhase::VTangent
+        ) {
             return Vec::new();
         }
         let Some(v) = self.poly(s).and_then(|p| p.vertices.get(self.vertex).copied()) else { return Vec::new() };
         let k = s.pixel_size() * 8.0;
         let mut out = vec![line(v.p - Vec2::new(k, k), v.p + Vec2::new(k, k)), line(v.p - Vec2::new(k, -k), v.p + Vec2::new(k, -k))];
-        if matches!(self.phase, PPhase::VMove | PPhase::VInsert) {
+        if matches!(self.phase, PPhase::VMove | PPhase::VInsert | PPhase::VTangent) {
             out.push(line(v.p, c));
+        }
+        if let (PPhase::VMark, Some(m)) = (self.phase, self.poly(s).and_then(|p| p.vertices.get(self.mark2).copied())) {
+            out.extend([line(m.p - Vec2::new(k, k), m.p + Vec2::new(k, k)), line(m.p - Vec2::new(k, -k), m.p + Vec2::new(k, -k))]);
         }
         out
     }
@@ -644,173 +707,8 @@ impl Interactive for PeditM {
 // SPLINEDIT
 // =====================================================================================
 
-fn spline_close(sp: &Spline) -> Spline {
-    if sp.closed {
-        return sp.clone();
-    }
-    let mut out = if sp.fit.len() >= 2 {
-        let mut f = sp.fit.clone();
-        f.extend(sp.fit.first().copied());
-        Spline::from_fit_points(&f)
-    } else {
-        let mut c = sp.control.clone();
-        c.extend(sp.control.first().copied());
-        Spline::from_control(c, sp.degree)
-    };
-    out.closed = true;
-    out
-}
-
-fn spline_open(sp: &Spline) -> Spline {
-    if !sp.closed {
-        return sp.clone();
-    }
-    let trim = |v: &[Vec2]| -> Vec<Vec2> {
-        let mut v = v.to_vec();
-        if v.len() > 2 && v.first().zip(v.last()).is_some_and(|(a, b)| a.near(*b, 1e-9)) {
-            v.pop();
-        }
-        v
-    };
-    if sp.fit.len() >= 2 { Spline::from_fit_points(&trim(&sp.fit)) } else { Spline::from_control(trim(&sp.control), sp.degree) }
-}
-
-pub(crate) fn spline_to_poly(sp: &Spline, precision: usize) -> LwPolyline {
-    let (lo, hi) = sp.domain();
-    let n = (precision.clamp(1, 99) * sp.control.len().max(2)).min(MAX_GEN);
-    let vs = (0..=n).map(|i| PolyVertex::new(sp.eval(lo + (hi - lo) * i as f64 / n as f64))).collect::<Vec<_>>();
-    let mut vs = vs;
-    if sp.closed && vs.len() > 2 {
-        vs.pop();
-    }
-    LwPolyline { vertices: vs, closed: sp.closed, const_width: 0.0, elevation: 0.0, plinegen: false }
-}
-
-fn run_splinedit(s: &mut Session, p: &Value) -> Result<Value> {
-    let h = targets(s, p)?.first().copied().ok_or_else(|| bad("splinedit", "`handle` is required"))?;
-    let e = curves::entity(s, h)?;
-    let EntityKind::Spline(sp) = &e.kind else { return Err(other("Object selected is not a spline.")) };
-    let opt = str_param(p, "option").ok_or_else(|| bad("splinedit", "`option` is required"))?.to_ascii_lowercase();
-    let k = match opt.as_str() {
-        "close" => EntityKind::Spline(spline_close(sp)),
-        "open" => EntityKind::Spline(spline_open(sp)),
-        "reverse" => EntityKind::Spline(curves::reverse_spline(sp)),
-        "purge" => EntityKind::Spline(Spline { fit: Vec::new(), ..sp.clone() }),
-        "refit" => {
-            let fit = points_param(p, "fit").unwrap_or_else(|| sp.fit.clone());
-            if fit.len() < 2 || fit.len() > MAX_GEN {
-                return Err(other("The spline has no fit data; give `fit` points."));
-            }
-            let mut n = Spline::from_fit_points(&fit);
-            n.closed = sp.closed;
-            EntityKind::Spline(n)
-        }
-        "polyline" => EntityKind::LwPolyline(spline_to_poly(sp, p.get("precision").and_then(Value::as_u64).unwrap_or(10) as usize)),
-        "move" => {
-            let i = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("splinedit", "`index` is required"))? as usize;
-            let to = point_req("splinedit", p, "to")?;
-            let mut n = sp.clone();
-            if !n.fit.is_empty() {
-                let f = n.fit.get_mut(i).ok_or_else(|| bad("splinedit", "index out of range"))?;
-                *f = to;
-                let closed = n.closed;
-                n = Spline::from_fit_points(&n.fit);
-                n.closed = closed;
-            } else {
-                let c = n.control.get_mut(i).ok_or_else(|| bad("splinedit", "index out of range"))?;
-                *c = to;
-            }
-            EntityKind::Spline(n)
-        }
-        _ => return Err(bad("splinedit", "unknown option")),
-    };
-    set_kind(s, h, k)?;
-    Ok(json!({ "handle": h.hex() }))
-}
-
-#[derive(Default)]
-struct SplineditM {
-    h: Option<Handle>,
-    fit_menu: bool,
-    history: Vec<EntityKind>,
-}
-
-impl Interactive for SplineditM {
-    fn name(&self) -> &'static str {
-        "SPLINEDIT"
-    }
-    fn prompt(&self, s: &Session) -> Prompt {
-        let Some(h) = self.h else { return Prompt::new("Select spline", Accept::POINT) };
-        if self.fit_menu {
-            return Prompt::new("Enter a fit data option", curves::KW)
-                .kw(&["Add", "Close", "Delete", "Kink", "Move", "Purge", "Tangents", "toLerance", "eXit"])
-                .default("eXit");
-        }
-        let closed = s.doc().ok().and_then(|d| d.entity(h)).is_some_and(|e| matches!(&e.kind, EntityKind::Spline(sp) if sp.closed));
-        Prompt::new("Enter an option", curves::KW)
-            .kw(&[if closed { "Open" } else { "Close" }, "Join", "Fit data", "Edit vertex", "convert to Polyline", "Reverse", "Undo", "eXit"])
-            .default("eXit")
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        let Some(h) = self.h else {
-            return match i {
-                Input::Point(p) => {
-                    let h = curves::pick_at(s, p).ok_or_else(|| other("*Invalid selection*"))?;
-                    if !matches!(curves::entity(s, h)?.kind, EntityKind::Spline(_)) {
-                        return Err(other("Object selected is not a spline."));
-                    }
-                    self.h = Some(h);
-                    s.set_selection(vec![h]);
-                    Ok(Step::Continue)
-                }
-                Input::Enter => Ok(Step::Cancel),
-                _ => Ok(Step::Continue),
-            };
-        };
-        let k = match &i {
-            Input::Keyword(k) | Input::Text(k) => k.trim().to_ascii_lowercase(),
-            Input::Enter => "exit".into(),
-            _ => return Ok(Step::Continue),
-        };
-        let mut apply = |s: &mut Session, opt: &str| -> Result<()> {
-            let before = curves::entity(s, h)?.kind;
-            run_splinedit(s, &json!({ "handle": h.hex(), "option": opt }))?;
-            self.history.push(before);
-            Ok(())
-        };
-        if self.fit_menu {
-            match k.as_str() {
-                "purge" | "p" => apply(s, "purge")?,
-                "close" | "c" => apply(s, "close")?,
-                "exit" | "x" => {}
-                _ => s.echo(format!("{k}: not available yet")),
-            }
-            self.fit_menu = false;
-            return Ok(Step::Continue);
-        }
-        match k.as_str() {
-            "close" | "c" => apply(s, "close")?,
-            "open" | "o" => apply(s, "open")?,
-            "reverse" | "r" => apply(s, "reverse")?,
-            "convert to polyline" | "p" => {
-                apply(s, "polyline")?;
-                return Ok(Step::Done);
-            }
-            "fit data" | "f" => self.fit_menu = true,
-            "undo" | "u" => {
-                if let Some(k) = self.history.pop() {
-                    set_kind(s, h, k)?;
-                }
-            }
-            "exit" | "x" => {
-                s.set_selection(Vec::new());
-                return Ok(Step::Done);
-            }
-            _ => s.echo(format!("{k}: not available yet")),
-        }
-        Ok(Step::Continue)
-    }
-}
+mod splinedit;
+use splinedit::{SplineditM, run_splinedit};
 
 // =====================================================================================
 // LENGTHEN
@@ -833,11 +731,13 @@ fn measure_len(k: &EntityKind) -> Option<(f64, Option<f64>)> {
             let g = Arc::new(a.center.xy(), a.radius, a.start, a.end);
             Some((g.len(), Some(g.sweep())))
         }
+        EntityKind::Ellipse(e) => Some((ellipse_of(e).length(), None)),
+        EntityKind::Spline(sp) if sp.is_valid() => Some((sp.length(), None)),
         _ => Chain::of(k).map(|c| (c.len(), None)),
     }
 }
 
-/// Lengthen a line, arc or open polyline at the end nearest `pick`.
+/// Lengthen a line, arc, open polyline, elliptical arc or open spline at the end nearest `pick`.
 pub(crate) fn lengthen_kind(k: &EntityKind, pick: Option<Vec2>, mode: LenMode) -> Result<EntityKind> {
     let too_short = || other("Lengthening would make the object zero length or negative.");
     match k {
@@ -922,7 +822,9 @@ pub(crate) fn lengthen_kind(k: &EntityKind, pick: Option<Vec2>, mode: LenMode) -
             }
             Ok(EntityKind::LwPolyline(LwPolyline { vertices: vs, ..p.clone() }))
         }
-        _ => Err(other("Select a line, arc or open polyline.")),
+        EntityKind::Ellipse(e) => curve_edits::lengthen_ellipse(e, pick, mode),
+        EntityKind::Spline(sp) => curve_edits::lengthen_spline(sp, pick, mode),
+        _ => Err(other("Select a line, arc, open polyline, elliptical arc or open spline.")),
     }
 }
 
@@ -1004,7 +906,8 @@ impl Interactive for LengthenM {
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let num = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { number(t) } else { None } };
-        let ang = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { crate::units::parse_angle(t) } else { None } };
+        let au = s.angle_settings();
+        let ang = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { au.amount(t) } else { None } };
         match (self.phase, &i) {
             (LPhase::Main, Input::Point(p)) => {
                 let h = curves::pick_at(s, *p).ok_or_else(|| other("*Invalid selection*"))?;
@@ -1395,6 +1298,7 @@ pub(crate) fn flatten_kind(k: &mut EntityKind) {
             z(&mut e.center);
             z(&mut e.major);
         }
+        EntityKind::Helix(h) => *k = EntityKind::Spline(h.spline()),
         EntityKind::LwPolyline(p) => p.elevation = 0.0,
         EntityKind::Polyline3d(p) => {
             *k = lwpoly(p.points.iter().map(|q| PolyVertex::new(q.xy())).collect(), p.closed);
@@ -1411,6 +1315,9 @@ pub(crate) fn flatten_kind(k: &mut EntityKind) {
         EntityKind::AttDef(a) => {
             z(&mut a.text.insert);
             a.text.align_pt.iter_mut().for_each(z);
+            if let Some(ml) = &mut a.multiline {
+                z(&mut ml.mtext.insert);
+            }
         }
         EntityKind::MText(t) => z(&mut t.insert),
         EntityKind::Insert(i) => {
@@ -1418,6 +1325,9 @@ pub(crate) fn flatten_kind(k: &mut EntityKind) {
             for a in &mut i.attribs {
                 z(&mut a.text.insert);
                 a.text.align_pt.iter_mut().for_each(z);
+                if let Some(ml) = &mut a.multiline {
+                    z(&mut ml.mtext.insert);
+                }
             }
         }
         EntityKind::Dimension(d) => {
@@ -1427,19 +1337,26 @@ pub(crate) fn flatten_kind(k: &mut EntityKind) {
             d.block = None;
         }
         EntityKind::Leader(l) => l.vertices.iter_mut().for_each(z),
+        EntityKind::MLine(m) => m.vertices.iter_mut().for_each(|v| z(&mut v.p)),
         EntityKind::MLeader(m) => {
             m.leaders.iter_mut().for_each(|l| l.iter_mut().for_each(z));
             z(&mut m.landing);
+            m.block.iter_mut().for_each(|b| z(&mut b.insert));
         }
         EntityKind::Hatch(h) => h.elevation = 0.0,
         EntityKind::Solid(so) | EntityKind::Trace(so) => so.corners.iter_mut().for_each(z),
         EntityKind::Face3d(f) => f.corners.iter_mut().for_each(z),
+        EntityKind::Region(_) => {}
         EntityKind::Image(i) => {
             z(&mut i.insert);
             i.u.z = 0.0;
             i.v.z = 0.0;
         }
         EntityKind::Table(t) => z(&mut t.insert),
+        EntityKind::Tolerance(t) => {
+            z(&mut t.insert);
+            t.dir.z = 0.0;
+        }
         EntityKind::Spline(_) | EntityKind::Viewport(_) | EntityKind::Wipeout(_) | EntityKind::Unknown(_) => {}
     }
 }
@@ -1541,7 +1458,7 @@ fn chspace(s: &mut Session, hs: &[Handle], to: Option<&str>, vp: Option<Handle>)
 fn run_chspace(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let (n, _, target) = chspace(s, &hs, str_param(p, "to"), curves::handle_param(p, "viewport"))?;
-    Ok(json!({ "moved": n, "to": match target { Space::Model => "model".to_string(), Space::Paper(n) => n } }))
+    Ok(json!({ "moved": n, "to": target.layout().unwrap_or("model") }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1800,11 +1717,18 @@ fn trim_for_fillet(k: &EntityKind, pick: Vec2, t: Vec2) -> Option<(Option<Entity
     }
 }
 
-/// Fillet two curves (lines, arcs, circles) with radius `r`. Returns the new arc, if any.
+/// Fillet two curves (lines, arcs, circles; elliptical arcs and splines in `curve_edits`) with
+/// radius `r`. Returns the new arc, if any.
 pub(crate) fn fillet_curves(s: &mut Session, h1: Handle, p1: Vec2, h2: Handle, p2: Vec2, r: f64) -> Result<Option<Handle>> {
+    if curves::is_locked(s, h1) || curves::is_locked(s, h2) {
+        return Err(other("The object is on a locked layer."));
+    }
     let e1 = curves::entity(s, h1)?;
     let e2 = curves::entity(s, h2)?;
-    let unsupported = || other("Fillet works on lines, arcs and circles (and polylines with the Polyline option).");
+    if [&e1, &e2].iter().any(|e| matches!(e.kind, EntityKind::Ellipse(_) | EntityKind::Spline(_))) {
+        return curve_edits::fillet_curvy(s, h1, p1, h2, p2, r, &e1, &e2);
+    }
+    let unsupported = || other("Fillet works on lines, arcs, circles, elliptical arcs and splines (and polylines with the Polyline option).");
     let o1 = TanObj::from_kind(&e1.kind, p1).filter(|_| matches!(e1.kind, EntityKind::Line(_) | EntityKind::Arc(_) | EntityKind::Circle(_)));
     let o2 = TanObj::from_kind(&e2.kind, p2).filter(|_| matches!(e2.kind, EntityKind::Line(_) | EntityKind::Arc(_) | EntityKind::Circle(_)));
     let (Some(o1), Some(o2)) = (o1, o2) else { return Err(unsupported()) };
@@ -1858,6 +1782,9 @@ pub(crate) fn fillet_curves(s: &mut Session, h1: Handle, p1: Vec2, h2: Handle, p
 
 /// Fillet every corner between two straight segments of a polyline. Returns the count.
 pub(crate) fn fillet_polyline(s: &mut Session, h: Handle, r: f64) -> Result<usize> {
+    if curves::is_locked(s, h) {
+        return Err(other("The object is on a locked layer."));
+    }
     let e = curves::entity(s, h)?;
     let EntityKind::LwPolyline(pl) = &e.kind else { return Err(other("Select a 2D polyline.")) };
     let vs = &pl.vertices;
@@ -2050,6 +1977,9 @@ pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<
             ts.sort_by(f64::total_cmp);
             ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
             let tp = curves::spline_param_of(sp, pick);
+            if sp.closed {
+                return curve_edits::trim_closed_spline(sp, &ts, tp);
+            }
             let lo = ts.iter().copied().filter(|t| *t < tp).fold(lo_d, f64::max);
             let hi = ts.iter().copied().filter(|t| *t > tp).fold(hi_d, f64::min);
             if lo == lo_d && hi == hi_d {
@@ -2072,7 +2002,7 @@ pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<
     }
 }
 
-/// Extend objects that modify.rs does not handle itself (elliptical arcs).
+/// Extend objects that modify.rs does not handle itself (elliptical arcs and open splines).
 pub(crate) fn extend_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<EntityKind> {
     match k {
         EntityKind::Ellipse(e) => {
@@ -2096,6 +2026,7 @@ pub(crate) fn extend_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Resul
             let t = t.ok_or_else(|| other("Object does not intersect an edge."))?;
             Ok(ellipse_kind(&if from_end { Ellipse { end: t, ..ge } } else { Ellipse { start: t, ..ge } }))
         }
+        EntityKind::Spline(sp) => curve_edits::extend_spline(sp, cut, pick),
         _ => Err(other("Cannot extend that object.")),
     }
 }
@@ -2123,13 +2054,14 @@ pub(crate) fn arraypath(
         return Err(other("Select objects to array."));
     }
     let (n, step) = match (count, spacing) {
-        (_, Some(sp)) if sp.is_finite() && sp > 0.0 => (((l / sp).floor() as usize + 1).clamp(1, MAX_GEN), sp),
+        (_, Some(sp)) if sp.is_finite() && sp > 0.0 => (((l / sp).floor() as usize).saturating_add(1), sp),
         (Some(n), _) => {
-            let n = n.clamp(1, MAX_GEN);
+            let n = n.max(1);
             (n, if c.closed { l / n as f64 } else { l / (n.max(2) - 1) as f64 })
         }
         _ => (6, if c.closed { l / 6.0 } else { l / 5.0 }),
     };
+    super::array::check_size(s, n as u64, objs.len())?;
     let Some((p0, t0)) = c.at_length(0.0) else { return Ok(Vec::new()) };
     let mut out = Vec::new();
     for i in 1..n {
@@ -2146,17 +2078,24 @@ pub(crate) fn arraypath(
 fn run_arraypath(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let path = curves::handle_param(p, "path").ok_or_else(|| bad("arraypath", "`path` (handle) is required"))?;
-    let count = p.get("count").and_then(Value::as_u64).map(|n| n.min(MAX_GEN as u64) as usize);
+    let count = p.get("count").and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     let spacing = p.get("spacing").and_then(Value::as_f64);
     let r = arraypath(s, &hs, path, count, spacing, bool_or(p, "align", true))?;
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
 }
 
 #[derive(Default)]
-struct PathArrayM {
+pub(super) struct PathArrayM {
     sel: SelectPhase,
     objs: Vec<Handle>,
     path: Option<Handle>,
+}
+
+impl PathArrayM {
+    /// Start at the path prompt with the objects already selected (ARRAY > PAth).
+    pub(super) fn with_objects(objs: Vec<Handle>) -> Self {
+        PathArrayM { sel: SelectPhase { picked: objs.clone(), done: true, ..SelectPhase::default() }, objs, path: None }
+    }
 }
 
 impl Interactive for PathArrayM {
@@ -2199,9 +2138,7 @@ impl Interactive for PathArrayM {
             }
             (Some(path), inp @ (Input::Text(_) | Input::Enter)) => {
                 let n = match &inp {
-                    Input::Text(t) => {
-                        number(t).filter(|n| *n >= 1.0 && *n <= MAX_GEN as f64).ok_or_else(|| other("Requires a count of 1 or more."))? as usize
-                    }
+                    Input::Text(t) => number(t).filter(|n| *n >= 1.0).ok_or_else(|| other("Requires a count of 1 or more."))? as usize,
                     _ => 6,
                 };
                 arraypath(s, &self.objs, path, Some(n), None, true)?;
@@ -2260,6 +2197,12 @@ fn run_textedit(s: &mut Session, p: &Value) -> Result<Value> {
 #[derive(Default)]
 struct TextEditM {
     h: Option<(Handle, String)>,
+    /// Edits made in this run, newest last: each object as it was before (the Undo option).
+    edits: Vec<(Handle, EntityKind)>,
+    /// Single mode: end after one edit (the Mode option; Multiple by default).
+    single: bool,
+    /// Asking for the edit mode.
+    mode: bool,
 }
 
 impl Interactive for TextEditM {
@@ -2267,12 +2210,26 @@ impl Interactive for TextEditM {
         "TEXTEDIT"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
+        if self.mode {
+            let current = if self.single { "Single" } else { "Multiple" };
+            return Prompt::new("Enter a text edit mode option", curves::KW).kw(&["Single", "Multiple"]).default(current);
+        }
         match &self.h {
-            None => Prompt::new("Select an annotation object or", Accept::POINT).kw(&["Undo", "Mode"]),
+            None => Prompt::new("Select an annotation object", Accept::POINT).kw(&["Undo", "Mode"]),
             Some((_, old)) => Prompt::new("Enter new text", Accept::TEXT).default(old.chars().take(40).collect::<String>()),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if self.mode {
+            match i {
+                Input::Keyword(k) if k == "Single" => self.single = true,
+                Input::Keyword(k) if k == "Multiple" => self.single = false,
+                Input::Enter => {}
+                _ => return Err(other("Enter Single or Multiple.")),
+            }
+            self.mode = false;
+            return Ok(Step::Continue);
+        }
         match (&self.h, i) {
             (None, Input::Point(p)) => {
                 let h = curves::pick_at(s, p).ok_or_else(|| other("*Invalid selection*"))?;
@@ -2281,16 +2238,29 @@ impl Interactive for TextEditM {
                 Ok(Step::Continue)
             }
             (Some((h, _)), Input::Text(t) | Input::Keyword(t)) => {
-                set_text(s, *h, &t)?;
+                let h = *h;
+                let before = curves::entity(s, h)?.kind;
+                set_text(s, h, &t)?;
+                self.edits.push((h, before));
                 self.h = None;
-                Ok(Step::Continue)
+                Ok(if self.single { Step::Done } else { Step::Continue })
             }
             (Some(_), Input::Enter) => {
                 self.h = None;
-                Ok(Step::Continue)
+                Ok(if self.single { Step::Done } else { Step::Continue })
             }
             (None, Input::Enter) => Ok(Step::Done),
-            (None, Input::Keyword(_)) => Ok(Step::Continue),
+            (None, Input::Keyword(k)) if k == "Undo" => {
+                match self.edits.pop() {
+                    Some((h, before)) => set_kind(s, h, before)?,
+                    None => s.echo("Everything has been undone"),
+                }
+                Ok(Step::Continue)
+            }
+            (None, Input::Keyword(k)) if k == "Mode" => {
+                self.mode = true;
+                Ok(Step::Continue)
+            }
             _ => Ok(Step::Continue),
         }
     }

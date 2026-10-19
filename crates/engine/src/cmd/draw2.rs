@@ -2,7 +2,7 @@
 //! options, DIVIDE/MEASURE, REVCLOUD, WIPEOUT, XLINE options, 3DPOLY, MLINE, HELIX, spline by
 //! control vertices, CENTERMARK and CENTERLINE. Each has a JSON form and a prompt sequence.
 
-use cadcraft_doc::{EntityKind, Handle, Point, Polyline3d, RayLine, Wipeout};
+use cadcraft_doc::{EntityKind, Handle, Helix, HelixConstrain, Point, Polyline3d, RayLine, Wipeout};
 use cadcraft_geom::{Arc, Circle, Ellipse, Line, PolyVertex, Polyline, Spline, TAU, Vec2, Vec3, norm_angle, shoelace};
 use serde_json::{Value, json};
 
@@ -12,8 +12,10 @@ use super::machines::number;
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
+pub(crate) mod mline;
+
 pub fn specs() -> Vec<CommandSpec> {
-    vec![
+    let mut v = vec![
         CommandSpec::new("arc.sce", "Start, Center, End", run_arc_variant)
             .menu(&["Draw", "Arc", "Start, Center, End"])
             .params("{start, center, end}")
@@ -113,14 +115,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["3p"])
             .params("{points: [[x,y,z?],...], closed?}")
             .interactive(|_| Ok(Box::new(Poly3dM::default()))),
-        CommandSpec::new("mline", "Multiline", run_mline)
-            .menu(&["Draw", "Multiline"])
-            .alias(&["ml"])
-            .params("{points, scale?, justification?: top|zero|bottom, closed?} (two offset polylines)")
-            .interactive(|s| Ok(Box::new(MlineM::new(s)))),
         CommandSpec::new("helix", "Helix", run_helix)
             .menu(&["Draw", "Helix"])
-            .params("{center, baseRadius, topRadius?, height?, turns?, ccw?} (3D polyline approximation)")
+            .params("{center, baseRadius, topRadius?, height?, turns?, ccw?, startAngle? (degrees)} → {handle}")
             .interactive(|_| Ok(Box::new(HelixM::default()))),
         CommandSpec::new("spline.cv", "Control Vertices", run_spline_cv)
             .menu(&["Draw", "Spline", "Control Vertices"])
@@ -134,7 +131,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Draw", "Center Line"])
             .params("{h1, h2} (two lines)")
             .interactive(|_| Ok(Box::new(CenterM { first: None, mark: false }))),
-    ]
+    ];
+    v.extend(mline::specs());
+    v
 }
 
 fn added(h: Handle) -> Result<Value> {
@@ -367,7 +366,10 @@ impl Interactive for SeqM {
         let val = match (&i, ask) {
             (Input::Point(q), _) => self.value_from_point(ask, *q),
             (Input::Text(t), Ask::Angle(_) | Ask::Sweep(..)) => {
-                Some(Val::N(crate::units::parse_angle(t).ok_or_else(|| other("Requires a valid angle."))?))
+                // The tangent direction is a direction; included angles are sizes.
+                let au = s.angle_settings();
+                let a = if self.v == ArcV::Sed { au.direction(t) } else { au.amount(t) };
+                Some(Val::N(a.ok_or_else(|| other("Requires a valid angle."))?))
             }
             (Input::Text(t), Ask::Dist(_)) => Some(Val::N(number(t).ok_or_else(|| other("Requires numeric distance or a point."))?)),
             (Input::Enter, _) => return Ok(Step::Cancel),
@@ -1291,15 +1293,20 @@ fn add_xline(s: &mut Session, base: Vec2, dir: Vec2) -> Result<Handle> {
     s.add_entity(EntityKind::XLine(RayLine { base: v3(base), dir: v3(d) }))
 }
 
-/// A line-like object for XLINE Offset/Reference: (base, direction).
-fn linear_of(s: &Session, h: Handle) -> Result<(Vec2, Vec2)> {
+/// A line-like object for XLINE Offset/Reference: (base, direction). For a polyline, the
+/// segment nearest `pick` (the first without one), which must be straight.
+fn linear_of(s: &Session, h: Handle, pick: Option<Vec2>) -> Result<(Vec2, Vec2)> {
     let e = curves::entity(s, h)?;
     match &e.kind {
         EntityKind::Line(l) => Ok((l.a.xy(), (l.b.xy() - l.a.xy()).normalized())),
         EntityKind::XLine(r) | EntityKind::Ray(r) => Ok((r.base.xy(), r.dir.xy().normalized())),
         EntityKind::LwPolyline(p) => {
             let segs = Polyline { vertices: p.vertices.clone(), closed: p.closed }.segments();
-            match segs.first() {
+            let seg = match pick {
+                Some(q) => segs.iter().min_by(|a, b| a.closest(q).dist(q).total_cmp(&b.closest(q).dist(q))),
+                None => segs.first(),
+            };
+            match seg {
                 Some(cadcraft_geom::Segment::Line(l)) => Ok((l.a, l.dir())),
                 _ => Err(other("Select a line object.")),
             }
@@ -1330,7 +1337,7 @@ pub(crate) fn run_xline2(s: &mut Session, p: &Value) -> Result<Value> {
         return added(add_xline(s, v, d)?);
     }
     if let Some(h) = curves::handle_param(p, "handle") {
-        let (base, dir) = linear_of(s, h)?;
+        let (base, dir) = linear_of(s, h, None)?;
         let (nb, nd) = if let Some(t) = point_param(p, "through") {
             (t, dir)
         } else {
@@ -1449,18 +1456,18 @@ impl Interactive for XlineM2 {
                 Ok(Step::Continue)
             }
             (XMode::AngAsk, Input::Text(t)) => {
-                let a = crate::units::parse_angle(&t).ok_or_else(|| other("Requires a valid angle."))?;
+                let a = s.angle_settings().direction(&t).ok_or_else(|| other("Requires a valid angle."))?;
                 self.mode = XMode::Fixed(a);
                 Ok(Step::Continue)
             }
             (XMode::RefSelect, Input::Point(p)) => {
                 let h = curves::pick_at(s, p).ok_or_else(|| other("*Invalid selection*"))?;
-                let (_, d) = linear_of(s, h)?;
+                let (_, d) = linear_of(s, h, Some(p))?;
                 self.mode = XMode::RefAngle(d.angle());
                 Ok(Step::Continue)
             }
             (XMode::RefAngle(base), Input::Text(t)) => {
-                let a = crate::units::parse_angle(&t).ok_or_else(|| other("Requires a valid angle."))?;
+                let a = s.angle_settings().rotation(&t).ok_or_else(|| other("Requires a valid angle."))?;
                 self.mode = XMode::Fixed(base + a);
                 Ok(Step::Continue)
             }
@@ -1488,7 +1495,7 @@ impl Interactive for XlineM2 {
             }
             (XMode::OffSelect, Input::Point(p)) => {
                 let h = curves::pick_at(s, p).ok_or_else(|| other("*Invalid selection*"))?;
-                self.line = Some(linear_of(s, h)?);
+                self.line = Some(linear_of(s, h, Some(p))?);
                 self.mode = XMode::OffSide;
                 Ok(Step::Continue)
             }
@@ -1557,7 +1564,11 @@ pub(crate) fn run_rectang2(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|c| (c.first().and_then(Value::as_f64).unwrap_or(0.0), c.get(1).and_then(Value::as_f64).unwrap_or(0.0)))
         .map(|(x, y)| (if x.is_finite() { x } else { 0.0 }, if y.is_finite() { y } else { 0.0 }))
         .unwrap_or((0.0, 0.0));
-    let fillet = f64_or(p, "fillet", 0.0);
+    if ch.0 < 0.0 || ch.1 < 0.0 {
+        return Err(bad("rectang", "`chamfer` distances must be zero or positive"));
+    }
+    let fillet = size_param("rectang", p, "fillet", true)?.unwrap_or(0.0);
+    let width = size_param("rectang", p, "width", true)?.unwrap_or(0.0);
     let (w, h) = if let Some(d) = p.get("dimensions").and_then(Value::as_array) {
         let l = d.first().and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("rectang", "dimensions: [length, width]"))?;
         let wd = d.get(1).and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("rectang", "dimensions: [length, width]"))?;
@@ -1586,7 +1597,7 @@ pub(crate) fn run_rectang2(s: &mut Session, p: &Value) -> Result<Value> {
     if w.abs() < 1e-12 || h.abs() < 1e-12 || !w.is_finite() || !h.is_finite() {
         return Err(bad("rectang", "rectangle has no area"));
     }
-    let k = rect_kind(a, w, h, rot, fillet, ch, f64_or(p, "width", 0.0), f64_or(p, "elevation", 0.0));
+    let k = rect_kind(a, w, h, rot, fillet, ch, width, f64_or(p, "elevation", 0.0));
     let hd = s.add_entity(k)?;
     let th = f64_or(p, "thickness", 0.0);
     if th != 0.0 {
@@ -1681,7 +1692,7 @@ impl Interactive for RectM2 {
         }
         match self.first {
             None => Prompt::new("Specify first corner point", Accept::POINT).kw(&["Chamfer", "Elevation", "Fillet", "Thickness", "Width"]),
-            Some(p) => Prompt::new("Specify other corner point", Accept::POINT).kw(&["Area", "Dimensions", "Rotation"]).base(p),
+            Some(p) => Prompt::new("Specify other corner point", Accept::POINT).kw(&["Area", "Dimensions", "Rotation"]).corner(p),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -1739,7 +1750,7 @@ impl Interactive for RectM2 {
                 RAsk::Rotation => match i {
                     Input::Keyword(_) => self.asking = Some(RAsk::RotPick1),
                     Input::Point(p) => self.rotation = self.first.map(|f| f.angle_to(p)).unwrap_or(0.0),
-                    Input::Text(t) => self.rotation = crate::units::parse_angle(&t).ok_or_else(|| other("Requires a valid angle."))?,
+                    Input::Text(t) => self.rotation = s.angle_settings().direction(&t).ok_or_else(|| other("Requires a valid angle."))?,
                     _ => {}
                 },
                 RAsk::RotPick1 => {
@@ -1878,203 +1889,13 @@ impl Interactive for Poly3dM {
 }
 
 // =====================================================================================
-// MLINE (two offset polylines)
-// =====================================================================================
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Just {
-    Top,
-    Zero,
-    Bottom,
-}
-
-fn mline_offsets(j: Just, scale: f64) -> [f64; 2] {
-    match j {
-        Just::Top => [0.0, -scale],
-        Just::Zero => [scale / 2.0, -scale / 2.0],
-        Just::Bottom => [scale, 0.0],
-    }
-}
-
-fn mline_kinds(pts: &[Vec2], closed: bool, j: Just, scale: f64) -> Vec<EntityKind> {
-    if pts.len() < 2 {
-        return Vec::new();
-    }
-    let pl = Polyline::from_points(pts, closed);
-    mline_offsets(j, scale)
-        .iter()
-        .filter_map(|d| {
-            let vs = if d.abs() < 1e-15 { Some(pl.vertices.clone()) } else { super::modify::offset_polyline(&pl, *d) };
-            vs.map(|vs| lwpoly(vs, closed))
-        })
-        .collect()
-}
-
-fn just_of(s: &str) -> Option<Just> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "t" | "top" => Some(Just::Top),
-        "z" | "zero" => Some(Just::Zero),
-        "b" | "bottom" => Some(Just::Bottom),
-        _ => None,
-    }
-}
-
-fn mline_defaults(s: &Session) -> (Just, f64) {
-    let d = s.doc().ok();
-    let metric = d.is_some_and(|d| d.header.i64("MEASUREMENT", 0) == 1);
-    let scale = d.map(|d| d.header.f64("CMLSCALE", if metric { 20.0 } else { 1.0 })).unwrap_or(1.0);
-    let j = match d.map(|d| d.header.i64("CMLJUST", 0)).unwrap_or(0) {
-        1 => Just::Zero,
-        2 => Just::Bottom,
-        _ => Just::Top,
-    };
-    (j, scale)
-}
-
-fn run_mline(s: &mut Session, p: &Value) -> Result<Value> {
-    let pts = points_param(p, "points").ok_or_else(|| bad("mline", "`points` (2 or more) is required"))?;
-    if pts.len() < 2 || pts.len() > MAX_GEN {
-        return Err(bad("mline", "need 2 or more points"));
-    }
-    let (dj, ds) = mline_defaults(s);
-    let j = match str_param(p, "justification") {
-        Some(t) => just_of(t).ok_or_else(|| bad("mline", "justification must be top, zero or bottom"))?,
-        None => dj,
-    };
-    let scale = f64_or(p, "scale", ds);
-    let mut hs = Vec::new();
-    for k in mline_kinds(&pts, bool_or(p, "closed", false), j, scale) {
-        hs.push(s.add_entity(k)?.hex());
-    }
-    Ok(json!({ "handles": hs }))
-}
-
-struct MlineM {
-    pts: Vec<Vec2>,
-    just: Just,
-    scale: f64,
-    asking: u8, // 0 none, 1 justification, 2 scale
-}
-
-impl MlineM {
-    fn new(s: &Session) -> Self {
-        let (just, scale) = mline_defaults(s);
-        MlineM { pts: Vec::new(), just, scale, asking: 0 }
-    }
-    fn finish(&self, s: &mut Session, closed: bool) -> Result<Step> {
-        for k in mline_kinds(&self.pts, closed, self.just, self.scale) {
-            s.add_entity(k)?;
-        }
-        Ok(Step::Done)
-    }
-}
-
-impl Interactive for MlineM {
-    fn name(&self) -> &'static str {
-        "MLINE"
-    }
-    fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        let j = match self.just {
-            Just::Top => "Top",
-            Just::Zero => "Zero",
-            Just::Bottom => "Bottom",
-        };
-        s.echo(format!("Current settings: Justification = {j}, Scale = {:.2}, Style = STANDARD", self.scale));
-        Ok(Step::Continue)
-    }
-    fn prompt(&self, _s: &Session) -> Prompt {
-        match self.asking {
-            1 => return Prompt::new("Enter justification type", curves::KW).kw(&["Top", "Zero", "Bottom"]).default("top"),
-            2 => return Prompt::new("Enter mline scale", Accept::NUMBER).default(format!("{:.2}", self.scale)),
-            _ => {}
-        }
-        match self.pts.len() {
-            0 => Prompt::new("Specify start point", Accept::POINT).kw(&["Justification", "Scale", "STyle"]),
-            1 => Prompt::new("Specify next point", Accept::POINT).base_opt(self.pts.last().copied()),
-            2 => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).base_opt(self.pts.last().copied()),
-            _ => Prompt::new("Specify next point", Accept::POINT).kw(&["Close", "Undo"]).base_opt(self.pts.last().copied()),
-        }
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        if self.asking == 1 {
-            if let Input::Keyword(k) | Input::Text(k) = &i {
-                self.just = just_of(k).ok_or_else(|| other("Enter Top, Zero or Bottom."))?;
-                s.doc_mut()?.header.set_i64(
-                    "CMLJUST",
-                    match self.just {
-                        Just::Top => 0,
-                        Just::Zero => 1,
-                        Just::Bottom => 2,
-                    },
-                );
-            }
-            self.asking = 0;
-            return Ok(Step::Continue);
-        }
-        if self.asking == 2 {
-            if let Input::Text(t) = &i {
-                self.scale = number(t).filter(|v| v.is_finite()).ok_or_else(|| other("Requires a number."))?;
-                s.doc_mut()?.header.set_f64("CMLSCALE", self.scale);
-            }
-            self.asking = 0;
-            return Ok(Step::Continue);
-        }
-        match i {
-            Input::Keyword(k) => {
-                match k.as_str() {
-                    "Justification" => self.asking = 1,
-                    "Scale" => self.asking = 2,
-                    "Undo" => {
-                        self.pts.pop();
-                    }
-                    "Close" => return self.finish(s, true),
-                    _ => s.echo("Only the STANDARD multiline style is available."),
-                }
-                Ok(Step::Continue)
-            }
-            Input::Point(p) => {
-                if self.pts.last().is_none_or(|l| !l.near(p, 1e-12)) && self.pts.len() < MAX_GEN {
-                    self.pts.push(p);
-                }
-                Ok(Step::Continue)
-            }
-            Input::Enter => {
-                if self.pts.len() >= 2 {
-                    self.finish(s, false)
-                } else {
-                    Ok(Step::Cancel)
-                }
-            }
-            _ => Ok(Step::Continue),
-        }
-    }
-    fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
-        if self.pts.is_empty() || self.asking != 0 {
-            return Vec::new();
-        }
-        let mut pts = self.pts.clone();
-        pts.push(c);
-        mline_kinds(&pts, false, self.just, self.scale)
-    }
-}
-
-// =====================================================================================
 // HELIX (3D polyline approximation)
 // =====================================================================================
 
-pub(crate) fn helix_points(c: Vec2, rb: f64, rt: f64, height: f64, turns: f64, ccw: bool, a0: f64) -> Vec<Vec3> {
-    let turns = turns.clamp(1e-3, 500.0);
-    let n = ((turns * 36.0).ceil() as usize).clamp(8, MAX_GEN);
-    let sign = if ccw { 1.0 } else { -1.0 };
-    (0..=n)
-        .map(|i| {
-            let t = i as f64 / n as f64;
-            let a = a0 + sign * TAU * turns * t;
-            let r = rb + (rt - rb) * t;
-            let p = Vec2::polar(c, r, a);
-            Vec3::new(p.x, p.y, height * t)
-        })
-        .collect()
+/// A helix entity (base centre `c`, radii, height, turns, twist, start angle).
+fn helix_kind(c: Vec2, rb: f64, rt: f64, height: f64, turns: f64, ccw: bool, a0: f64) -> EntityKind {
+    let h = Helix { center: c.to3(0.0), base_radius: rb, top_radius: rt, height, turns, start_angle: a0, ccw, constrain: HelixConstrain::Height };
+    EntityKind::Helix(h.sanitized())
 }
 
 fn run_helix(s: &mut Session, p: &Value) -> Result<Value> {
@@ -2085,8 +1906,11 @@ fn run_helix(s: &mut Session, p: &Value) -> Result<Value> {
     if !(rb > 0.0 && rt >= 0.0 && turns > 0.0 && turns <= 500.0) {
         return Err(bad("helix", "radii must be positive and turns in (0, 500]"));
     }
-    let pts = helix_points(c, rb, rt, f64_or(p, "height", 1.0), turns, bool_or(p, "ccw", true), f64_or(p, "startAngle", 0.0).to_radians());
-    added(s.add_entity(EntityKind::Polyline3d(Polyline3d { points: pts, closed: false }))?)
+    let height = f64_or(p, "height", 1.0);
+    if height.abs() > 1e12 || rb > 1e12 || rt > 1e12 {
+        return Err(bad("helix", "sizes are out of range"));
+    }
+    added(s.add_entity(helix_kind(c, rb, rt, height, turns, bool_or(p, "ccw", true), f64_or(p, "startAngle", 0.0).to_radians()))?)
 }
 
 #[derive(Default)]
@@ -2108,8 +1932,10 @@ impl HelixM {
     fn create(&self, s: &mut Session, height: f64) -> Result<Step> {
         let (Some(c), Some(rb)) = (self.center, self.rb) else { return Ok(Step::Cancel) };
         let rt = self.rt.unwrap_or(rb);
-        let pts = helix_points(c, rb, rt, height, self.turns(), !self.cw, self.start.unwrap_or(0.0));
-        s.add_entity(EntityKind::Polyline3d(Polyline3d { points: pts, closed: false }))?;
+        if !height.is_finite() || height.abs() > 1e12 {
+            return Err(other("Requires a distance."));
+        }
+        s.add_entity(helix_kind(c, rb, rt, height, self.turns(), !self.cw, self.start.unwrap_or(0.0)))?;
         Ok(Step::Done)
     }
 }
@@ -2237,8 +2063,7 @@ impl Interactive for HelixM {
         match (self.center, self.rb, self.rt) {
             (Some(ct), None, _) => vec![circle(ct, ct.dist(c))],
             (Some(ct), Some(rb), None) => {
-                let pts = helix_points(ct, rb, ct.dist(c), 0.0, self.turns(), !self.cw, self.start.unwrap_or(0.0));
-                vec![EntityKind::Polyline3d(Polyline3d { points: pts, closed: false })]
+                vec![helix_kind(ct, rb, ct.dist(c), 0.0, self.turns(), !self.cw, self.start.unwrap_or(0.0))]
             }
             _ => Vec::new(),
         }
@@ -2352,7 +2177,7 @@ impl Interactive for SplineCvM {
 fn add_center_line(s: &mut Session, a: Vec2, b: Vec2) -> Result<Handle> {
     let d = s.doc_mut()?;
     if d.linetype("CENTER").is_none()
-        && let Some(lt) = cadcraft_doc::library::standard_linetypes().into_iter().find(|l| l.name == "CENTER")
+        && let Some(lt) = cadcraft_doc::library::standard_linetypes_for(d).into_iter().find(|l| l.name == "CENTER")
     {
         d.linetypes.push(lt);
     }

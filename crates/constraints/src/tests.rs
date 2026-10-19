@@ -156,6 +156,19 @@ fn symmetric_fix() {
 }
 
 #[test]
+fn two_line_angle_over_180_is_rejected() {
+    let mut d = Drawing::default();
+    let a = line(&mut d, (0.0, 0.0), (10.0, 0.0));
+    let b = line(&mut d, (0.0, 0.0), (0.0, 5.0));
+    let before = (ln(&d, a), ln(&d, b));
+    assert!(add(&mut d, dim(ConstraintKind::Angular, &[w(a), w(b)], "", "200"), &SolveOptions::default()).is_err());
+    assert!(d.constraints.is_empty());
+    assert_eq!((ln(&d, a), ln(&d, b)), before);
+    ok(&mut d, dim(ConstraintKind::Angular, &[w(a), w(b)], "", "180"));
+    assert!(all_satisfied(&d));
+}
+
+#[test]
 fn dimensional_constraints() {
     let mut d = Drawing::default();
     let a = line(&mut d, (0.0, 0.0), (10.0, 1.0));
@@ -432,4 +445,47 @@ fn autoconstrain_rectangle_of_lines() {
     let l = line(&mut d, (50.0, 0.0), (60.0, 0.001));
     let only_v = InferOptions { types: vec!["Vertical".into()], ..Default::default() };
     assert!(autoconstrain(&mut d, &[l], &only_v).is_empty());
+}
+
+#[test]
+fn set_parameter_rejects_out_of_domain_dimension() {
+    let opts = SolveOptions::default();
+    let mut d = Drawing::default();
+    let l = line(&mut d, (0.0, 0.0), (10.0, 0.0));
+    ok(&mut d, dim(ConstraintKind::Distance(DistAxis::Aligned), &[w(l)], "d1", "8"));
+    let c = circle(&mut d, (0.0, 20.0), 5.0);
+    ok(&mut d, dim(ConstraintKind::Radius, &[w(c)], "rad1", "3"));
+    let before = d.clone();
+    assert!(set_parameter(&mut d, "d1", "-5", &opts).is_err());
+    assert!(set_parameter(&mut d, "rad1", "0", &opts).is_err());
+    assert_eq!(d, before);
+    set_parameter(&mut d, "d1", "6", &opts).unwrap();
+    set_parameter(&mut d, "rad1", "2", &opts).unwrap();
+    assert!(all_satisfied(&d));
+}
+
+/// The solver may meet a coincidence with a negative arc radius; the stored arc must still put
+/// the referenced point where the solver did (issue #703), through `add` and through `solve`.
+#[test]
+fn arc_solved_with_a_negative_radius_keeps_its_points() {
+    use std::f64::consts::FRAC_PI_2;
+    // (arc centre, radius, start, end, point): a semicircle with the point behind it, and the
+    // asymmetric case from the issue.
+    let cases = [((0.0, 0.0), 1.0, -FRAC_PI_2, FRAC_PI_2, (-5.0, 0.0)), ((6.694, -0.686), 0.62075, 3.4824, 1.1766, (-7.562, 4.946))];
+    for (c, r, a0, a1, p) in cases {
+        for through_solve in [false, true] {
+            let mut d = Drawing::default();
+            let a = arc(&mut d, c, r, a0, a1);
+            let q = add_e(&mut d, EntityKind::Point(DPoint { p: v(p.0, p.1), angle: 0.0 }));
+            let k = con(ConstraintKind::Coincident, &[s(a, Sub::Mid), w(q)]);
+            if through_solve {
+                d.constraints.push(Constraint { id: 1, ..k });
+                solve(&mut d, &SolveOptions::default()).unwrap();
+            } else {
+                ok(&mut d, k);
+            }
+            assert!(all_satisfied(&d), "{c:?} solve {through_solve}: {:?}", residuals(&d));
+            assert!(circ(&d, a).1 > 0.0);
+        }
+    }
 }

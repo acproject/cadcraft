@@ -1,6 +1,7 @@
 //! Parametric display: geometric constraint bars and dynamic dimensional constraints drawn over
 //! the canvas (from the engine's `constraints.inspect`), inline editing of a dimensional
-//! constraint's expression, and the Parameters Manager.
+//! constraint's expression, the degrees of freedom left (`constraints.dof`: a status strip on
+//! each constraint bar and a summary on the canvas), and the Parameters Manager.
 //!
 //! Every edit runs an engine command (`parameters {name, expr}` / `{delete}`); this module only
 //! draws and collects input.
@@ -30,11 +31,41 @@ pub struct Glyph {
     pub satisfied: bool,
 }
 
+/// Degrees of freedom of one constrained object (`constraints.dof`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ObjectDof {
+    pub handle: String,
+    pub dof: Option<usize>,
+    /// `under`, `fully`, `over` or `unknown`.
+    pub status: String,
+}
+
+/// The drawing's degrees of freedom as `constraints.dof` reports them.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Dof {
+    pub dof: Option<usize>,
+    pub status: String,
+    pub objects: Vec<ObjectDof>,
+}
+
+/// What a DOF status reads as, and its colour (`None`: nothing to say).
+fn dof_text(status: &str, dof: Option<usize>) -> Option<(String, Color32)> {
+    match (status, dof) {
+        ("fully", _) => Some((crate::tf!("Degrees of freedom: {n}", n = 0), Color32::from_rgb(0x4c, 0xaf, 0x50))),
+        ("over", _) => Some((crate::tl!("Over-constrained").to_string(), Color32::from_rgb(0xff, 0x8a, 0x6a))),
+        ("under", Some(n)) => Some((crate::tf!("Degrees of freedom: {n}", n = n), Color32::from_rgb(0x9f, 0xb6, 0xd6))),
+        _ => None,
+    }
+}
+
 /// Per-drawing-revision cache of the constraint glyphs (inspect is not free on big drawings).
 #[derive(Default)]
 pub struct Cache {
     key: Option<(u64, u64, usize)>,
     glyphs: Vec<Glyph>,
+    dof: Dof,
     /// The dimensional constraint whose expression is being edited: (name, buffer, screen pos).
     editing: Option<(String, String, Pos2)>,
 }
@@ -51,6 +82,7 @@ fn refresh(app: &mut CadApp) {
     }
     app.canvas.param.key = key;
     app.canvas.param.glyphs.clear();
+    app.canvas.param.dof = Dof::default();
     if app.session.doc().is_ok_and(|d| d.constraints.is_empty()) {
         return;
     }
@@ -58,6 +90,10 @@ fn refresh(app: &mut CadApp) {
         && let Some(g) = v.get("glyphs")
     {
         app.canvas.param.glyphs = serde_json::from_value(g.clone()).unwrap_or_default();
+    }
+    // Every constrained object (an empty list: not the selection).
+    if let Ok(v) = app.session.execute("constraints.dof", &json!({ "handles": [] })) {
+        app.canvas.param.dof = serde_json::from_value(v).unwrap_or_default();
     }
 }
 
@@ -360,7 +396,12 @@ pub fn draw_overlay(app: &mut CadApp, ui: &mut egui::Ui, painter: &egui::Painter
         if resp.double_clicked() {
             act = Some(Act::Edit(c.name.clone(), c.expr.clone(), r.left_center()));
         }
-        resp.on_hover_text(format!("{} constraint {} = {}  (double-click to edit)", c.kind.name(), c.name, c.expr));
+        resp.on_hover_text(crate::tf!(
+            "{kind} constraint {name} = {expression}  (double-click to edit)",
+            kind = crate::i18n::t(c.kind.name()),
+            name = c.name,
+            expression = c.expr
+        ));
     }
     // ----- geometric constraint bars -----
     let mut bars: Vec<(Handle, Vec2, Vec<(&str, u32)>)> = Vec::new();
@@ -406,7 +447,10 @@ pub fn draw_overlay(app: &mut CadApp, ui: &mut egui::Ui, painter: &egui::Painter
             continue;
         }
         let n = kinds.len().min(16) as f32;
-        let mut r = Rect::from_min_size(sp + vec2(8.0, 8.0), vec2(n * cell + 4.0, cell + 4.0));
+        let od = app.canvas.param.dof.objects.iter().find(|o| Handle::parse_hex(&o.handle) == Some(*h));
+        let status = od.and_then(|o| dof_text(&o.status, o.dof));
+        let strip = if status.is_some() { 6.0 } else { 0.0 };
+        let mut r = Rect::from_min_size(sp + vec2(8.0, 8.0), vec2(n * cell + 4.0 + strip, cell + 4.0));
         for _ in 0..12 {
             if placed.iter().any(|p| p.intersects(r)) {
                 r = r.translate(vec2(0.0, cell + 6.0));
@@ -425,8 +469,24 @@ pub fn draw_overlay(app: &mut CadApp, ui: &mut egui::Ui, painter: &egui::Painter
                 painter.rect_filled(cr.shrink(1.0), 3.0, Color32::from_rgb(0xf2, 0xf4, 0xf7));
             }
             paint_glyph(painter, cr.shrink(2.0), kind, Color32::from_rgb(0x26, 0x2b, 0x33));
-            resp.on_hover_text(format!("{kind} (constraint {id})"));
+            resp.on_hover_text(crate::tf!("{kind} (constraint {id})", kind = crate::i18n::t(kind), id = id));
         }
+        // The object's constraint state: a coloured strip at the end of its bar.
+        if let Some((text, col)) = status {
+            let sr = Rect::from_min_max(pos2(r.right() - strip - 1.0, r.top() + 3.0), pos2(r.right() - 2.0, r.bottom() - 3.0));
+            painter.rect_filled(sr, 2.0, col.gamma_multiply(alpha.max(0.5)));
+            ui.interact(sr.expand(2.0), ui.id().with(("cbar_dof", h.0)), Sense::hover()).on_hover_text(text);
+        }
+    }
+    // The drawing's constraint state.
+    if let Some((text, col)) = dof_text(&app.canvas.param.dof.status, app.canvas.param.dof.dof)
+        && (set.bars_visible || !set.bar_exceptions.is_empty())
+    {
+        let galley = painter.layout_no_wrap(text, crate::theme::small(), col);
+        let at = pos2(xf.rect.left() + 96.0, xf.rect.bottom() - 10.0 - galley.size().y);
+        let r = Rect::from_min_size(at, galley.size() + vec2(8.0, 4.0));
+        painter.rect_filled(r, 2.0, t.canvas.gamma_multiply(0.85));
+        painter.galley(at + vec2(4.0, 2.0), galley, col);
     }
     let _ = act_take(app, act, ui);
 }
@@ -514,57 +574,66 @@ pub fn parameters_dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool)
     let filter_id = egui::Id::new("par_filter");
     let mut filter = ctx.data_mut(|d| d.get_temp::<String>(filter_id)).unwrap_or_default();
     let mut action: Option<Value> = None;
-    egui::Window::new("Parameters Manager").open(open).default_size(vec2(560.0, 300.0)).resizable(true).show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("ƒx  New User Parameter").on_hover_text("Creates a user parameter").clicked() {
-                let mut n = 1;
-                while rows.iter().any(|r| r.name == format!("user{n}")) {
-                    n += 1;
-                }
-                action = Some(json!({ "name": format!("user{n}"), "expr": "1" }));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search for parameter").desired_width(170.0));
-            });
-        });
-        ui.separator();
-        let f = filter.to_ascii_lowercase();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("par_grid").striped(true).num_columns(5).spacing(vec2(12.0, 4.0)).min_col_width(60.0).show(ui, |ui| {
-                for h in ["Name", "Expression", "Value", "Type", ""] {
-                    ui.label(egui::RichText::new(h).strong());
-                }
-                ui.end_row();
-                for (kind, title) in [("dimensional", "Dimensional Constraint Parameters"), ("user", "User Parameters")] {
-                    let group: Vec<&Row> =
-                        rows.iter().filter(|r| r.kind == kind && (f.is_empty() || r.name.to_ascii_lowercase().contains(&f))).collect();
-                    ui.label(egui::RichText::new(title).color(t.text_dim).small());
-                    ui.end_row();
-                    for r in group {
-                        ui.label(&r.name);
-                        let id = egui::Id::new(("par_expr", &r.name));
-                        if let Some(v) = expr_field(ui, id, &r.expr) {
-                            action = Some(json!({ "name": r.name, "expr": v }));
-                        }
-                        match (&r.value, &r.error) {
-                            (Some(v), _) => ui.label(trim_num(*v, 4)),
-                            (None, Some(e)) => ui.label(egui::RichText::new("error").color(Color32::from_rgb(0xff, 0x8a, 0x6a))).on_hover_text(e),
-                            _ => ui.label(""),
-                        };
-                        ui.label(egui::RichText::new(if kind == "user" { "User" } else { r.description.as_str() }).color(t.text_dim));
-                        if kind == "user" {
-                            if ui.small_button("Delete").clicked() {
-                                action = Some(json!({ "delete": r.name }));
-                            }
-                        } else {
-                            ui.label("");
-                        }
-                        ui.end_row();
+    egui::Window::new(crate::tl!("Parameters Manager"))
+        .id(egui::Id::new("Parameters Manager"))
+        .open(open)
+        .default_size(vec2(560.0, 300.0))
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(crate::tl!("ƒx  New User Parameter")).on_hover_text(crate::tl!("Creates a user parameter")).clicked() {
+                    let mut n = 1;
+                    while rows.iter().any(|r| r.name == format!("user{n}")) {
+                        n += 1;
                     }
+                    action = Some(json!({ "name": format!("user{n}"), "expr": "1" }));
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut filter).hint_text(crate::tl!("Search for parameter")).desired_width(170.0));
+                });
+            });
+            ui.separator();
+            let f = filter.to_ascii_lowercase();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("par_grid").striped(true).num_columns(5).spacing(vec2(12.0, 4.0)).min_col_width(60.0).show(ui, |ui| {
+                    for h in ["Name", "Expression", "Value", "Type", ""] {
+                        ui.label(egui::RichText::new(crate::i18n::t(h)).strong());
+                    }
+                    ui.end_row();
+                    for (kind, title) in [("dimensional", "Dimensional Constraint Parameters"), ("user", "User Parameters")] {
+                        let group: Vec<&Row> =
+                            rows.iter().filter(|r| r.kind == kind && (f.is_empty() || r.name.to_ascii_lowercase().contains(&f))).collect();
+                        ui.label(egui::RichText::new(crate::i18n::t(title)).color(t.text_dim).small());
+                        ui.end_row();
+                        for r in group {
+                            ui.label(&r.name);
+                            let id = egui::Id::new(("par_expr", &r.name));
+                            if let Some(v) = expr_field(ui, id, &r.expr) {
+                                action = Some(json!({ "name": r.name, "expr": v }));
+                            }
+                            match (&r.value, &r.error) {
+                                (Some(v), _) => ui.label(trim_num(*v, 4)),
+                                (None, Some(e)) => {
+                                    ui.label(egui::RichText::new(crate::tl!("error")).color(Color32::from_rgb(0xff, 0x8a, 0x6a))).on_hover_text(e)
+                                }
+                                _ => ui.label(""),
+                            };
+                            ui.label(
+                                egui::RichText::new(crate::i18n::t(if kind == "user" { "User" } else { r.description.as_str() })).color(t.text_dim),
+                            );
+                            if kind == "user" {
+                                if ui.small_button(crate::tl!("Delete")).clicked() {
+                                    action = Some(json!({ "delete": r.name }));
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
             });
         });
-    });
     ctx.data_mut(|d| d.insert_temp(filter_id, filter));
     if let Some(p) = action {
         let _ = app.run("parameters", p);
@@ -575,7 +644,9 @@ pub fn parameters_dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool)
 pub fn expr_field(ui: &mut egui::Ui, id: egui::Id, value: &str) -> Option<String> {
     let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.to_string());
     let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id.with("te")).desired_width(150.0));
-    if resp.has_focus() {
+    // Focus from memory: `Response::has_focus` is false while the OS window is unfocused,
+    // which dropped the pending edit (matches `palettes::edit_field`).
+    if ui.memory(|m| m.has_focus(id.with("te"))) {
         ui.data_mut(|d| d.insert_temp(id, buf.clone()));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
@@ -598,5 +669,26 @@ mod tests {
     fn number_trimming() {
         assert_eq!(trim_num(12.5, 4), "12.5");
         assert_eq!(trim_num(45.0, 2), "45");
+    }
+
+    fn frame(ctx: &egui::Context, focused: bool, events: Vec<egui::Event>) -> Option<String> {
+        let mut out = None;
+        let input = egui::RawInput { focused, events, ..Default::default() };
+        ctx.run_ui(input, |ui| out = expr_field(ui, egui::Id::new("e"), "1")).drop_without_applying_deltas();
+        out
+    }
+
+    #[test]
+    fn pending_expression_survives_window_blur() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("e");
+        frame(&ctx, true, vec![]);
+        ctx.memory_mut(|m| m.request_focus(id.with("te")));
+        frame(&ctx, true, vec![egui::Event::Text("+2".into())]);
+        frame(&ctx, false, vec![egui::Event::WindowFocused(false)]);
+        frame(&ctx, true, vec![egui::Event::WindowFocused(true)]);
+        assert_eq!(ctx.data_mut(|d| d.get_temp::<String>(id)).as_deref(), Some("1+2"));
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        assert_eq!(frame(&ctx, true, vec![enter]).as_deref(), Some("1+2"));
     }
 }
