@@ -105,10 +105,10 @@ echo "dev 独有提交：$AHEAD    上游 main 新增提交：$BEHIND"
 if [ "$BEHIND" -gt 0 ]; then
   echo
   echo "上游新增提交（最多显示 30 条）："
-  git log --oneline --no-merges "$DEV_BRANCH..$UPSTREAM_REF" | head -n 30 | sed 's/^/  /'
+  git log --oneline -30 --no-merges "$DEV_BRANCH..$UPSTREAM_REF" | sed 's/^/  /'
   echo
   echo "变更概览（文件级统计，最多 40 行）："
-  git diff --stat "$DEV_BRANCH...$UPSTREAM_REF" | head -n 40 | sed 's/^/  /'
+  head -n 40 < <(git diff --stat "$DEV_BRANCH...$UPSTREAM_REF") | sed 's/^/  /'
 else
   ok "上游 main 没有新提交，dev 已是最新"
 fi
@@ -159,7 +159,7 @@ SIGNAL_RE='CommandSpec::new\("(box|wedge|cone|sphere|cylinder|torus|pyramid|poly
 SIGNALS="$(git grep -I -n -E "$SIGNAL_RE" "$UPSTREAM_REF" -- crates 2>/dev/null || true)"
 if [ -n "$SIGNALS" ]; then
   printf '%s\n' "${C_GRN}✔ 上游已出现 3D 相关命令注册：${C_RST}"
-  printf '%s\n' "$SIGNALS" | head -n 30 | sed 's/^/  /'
+  head -n 30 < <(printf '%s\n' "$SIGNALS") | sed 's/^/  /'
 else
   printf '%s\n' "${C_YLW}● 上游 crates/ 中未发现 box/extrude/revolve/3dorbit/ucs 等命令注册，M11 尚无代码落地${C_RST}"
 fi
